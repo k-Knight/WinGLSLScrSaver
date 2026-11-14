@@ -1,12 +1,13 @@
 // ===========================================================================
-// ShaderSaver - a GLSL shader screensaver for Windows (.scr)
+// WinGLSLScrSaver - a GLSL shader screensaver for Windows (.scr)
 // ---------------------------------------------------------------------------
 // Renders a GLSL fragment shader on the GPU (Direct3D 11 via Pie) as a real
 // Windows screensaver with full /s /p /c support.
 //
 // DEBUG BUILD NOTES:
-//   * Every step logs to shadersaver.log next to the exe (falls back to
-//     %TEMP%\shadersaver.log if the exe dir is not writable).
+//   * DEBUG builds and --diag runs log to winglslscrsaver.log next to the
+//     working directory (falls back to %TEMP%). Release builds are silent:
+//     no log file, no fragment dump, zero per-call file I/O.
 //   * Fatal exceptions are logged AND shown in a MessageBox.
 //   * GPU device creation is deferred until AFTER the form is shown and
 //     (for preview) reparented - WinForms recreates window handles when
@@ -24,7 +25,6 @@ using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
-using Microsoft.Win32;
 using Pie;
 using Pie.ShaderCompiler;
 using D3D = Vortice.Direct3D11;
@@ -37,33 +37,39 @@ internal static class Log
     private static readonly object _lock = new();
     private static string _path;
 
+    // Logging is a debug aid: enabled in DEBUG builds or when a --diag mode
+    // was requested explicitly. Release runs stay silent - no log file and
+    // no per-call file I/O (startup slowdown report).
+    internal static bool Verbose =
+#if DEBUG
+        true;
+#else
+        false;
+#endif
+
     public static string Path
     {
         get
         {
             if (_path != null) return _path;
-            // Prefer the current working directory (easy to find), then the exe
-            // dir (for a single-file .NET app this is the %TEMP%\.net extraction
-            // dir!), then TEMP as a last resort.
-            foreach (string dir in new[] { Environment.CurrentDirectory, AppContext.BaseDirectory, System.IO.Path.GetTempPath() })
+            // Logs live in %localappdata%\WinGLSLScrSaver\ next to the config
+            // file - never next to the exe (a screensaver's working directory
+            // is wherever Windows launched it from, e.g. System32).
+            try
             {
-                try
-                {
-                    string candidate = System.IO.Path.Combine(dir, "shadersaver.log");
-                    File.WriteAllText(candidate, "");
-                    _path = candidate;
-                    break;
-                }
-                catch { }
+                Directory.CreateDirectory(Settings.AppDataDir);
+                _path = System.IO.Path.Combine(Settings.AppDataDir, "winglslscrsaver.log");
+                return _path;
             }
-            if (_path == null)
-                _path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "shadersaver.log");
+            catch { }
+            _path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "winglslscrsaver.log");
             return _path;
         }
     }
 
     public static void W(string msg)
     {
+        if (!Verbose) return;
         string line = $"[{DateTime.Now:HH:mm:ss.fff}] {msg}";
         lock (_lock)
         {
@@ -803,25 +809,37 @@ internal class ConfigDialog : Form
 
     public ConfigDialog()
     {
-        Text = "ShaderSaver Settings";
+        Text = "WinGLSLScrSaver Settings";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MinimizeBox = MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         ClientSize = new Size(460, 120);
 
         var label = new Label { Text = "Fragment shader file:", Location = new Point(12, 12), AutoSize = true };
-        _pathBox = new TextBox { Location = new Point(12, 34), Width = 340, Text = Settings.LoadShaderPath() };
+        // Default to the %localappdata%\WinGLSLScrSaver folder (where shaders
+        // are searched when nothing is configured) instead of an empty box.
+        string configured = Settings.LoadShaderPath();
+        _pathBox = new TextBox
+        {
+            Location = new Point(12, 34), Width = 340,
+            Text = string.IsNullOrWhiteSpace(configured) ? Settings.AppDataDir : configured,
+        };
         var browse = new Button { Text = "Browse...", Location = new Point(360, 32), Width = 85 };
         var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(270, 78), Width = 85 };
         var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(360, 78), Width = 85 };
 
         browse.Click += (_, _) =>
         {
+            // Default the file dialog to the folder the .scr itself lives in.
+            // NOTE: AppContext.BaseDirectory would be the %TEMP% extraction dir
+            // for a single-file published app - Environment.ProcessPath gives
+            // the real .scr location.
+            string scrDir = System.IO.Path.GetDirectoryName(Environment.ProcessPath) ?? Environment.CurrentDirectory;
             using var dlg = new OpenFileDialog
             {
                 Title = "Pick a GLSL fragment shader",
                 Filter = "Fragment shaders (*.fs;*.glsl;*.frag)|*.fs;*.glsl;*.frag|All files (*.*)|*.*",
-                InitialDirectory = Path.GetDirectoryName(AppContext.BaseDirectory) ?? Environment.CurrentDirectory,
+                InitialDirectory = scrDir,
             };
             if (dlg.ShowDialog(this) == DialogResult.OK) _pathBox.Text = dlg.FileName;
         };
@@ -840,22 +858,28 @@ internal class ConfigDialog : Form
 }
 
 // ---------------------------------------------------------------------------
-// Settings persistence (registry, like classic screensavers).
+// Settings persistence: a plain config file in %localappdata%\WinGLSLScrSaver\.
+// That folder is also the default shader location when nothing is configured,
+// so no machine-specific path is ever baked in.
 // ---------------------------------------------------------------------------
 internal static class Settings
 {
-    private const string KeyPath = @"Software\ShaderSaver";
+    public static string AppDataDir => System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "WinGLSLScrSaver");
+
+    private static string ConfigPath => System.IO.Path.Combine(AppDataDir, "config.txt");
 
     public static string LoadShaderPath()
     {
-        using var key = Registry.CurrentUser.OpenSubKey(KeyPath);
-        return key?.GetValue("ShaderPath") as string ?? "";
+        try { return File.ReadAllText(ConfigPath).Trim(); }
+        catch { return ""; }
     }
 
     public static void SaveShaderPath(string path)
     {
-        using var key = Registry.CurrentUser.CreateSubKey(KeyPath);
-        key.SetValue("ShaderPath", path ?? "");
+        Directory.CreateDirectory(AppDataDir);
+        File.WriteAllText(ConfigPath, path ?? "");
     }
 }
 
@@ -970,10 +994,13 @@ internal static class Program
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
             Log.Ex("UnhandledException", (Exception) e.ExceptionObject);
 
+        // NOTE: never interpolate Log.Path into a W() call unconditionally -
+        // the argument is evaluated even when logging is off, which used to
+        // create an empty log file next to the exe in Release.
         Log.W("=================================================");
-        Log.W($"ShaderSaver starting. args=[{string.Join(" ", args)}]");
-        Log.W($"Log file: {Log.Path}");
-        Log.W($"exe: {AppContext.BaseDirectory}ShaderSaver.exe");
+        Log.W($"WinGLSLScrSaver starting. args=[{string.Join(" ", args)}]");
+        if (Log.Verbose) Log.W($"Log file: {Log.Path}");
+        Log.W($"exe: {Environment.ProcessPath ?? AppContext.BaseDirectory}");
 
         try
         {
@@ -1015,6 +1042,7 @@ internal static class Program
             if (dm.Success)
             {
                 DiagMode = dm.Groups[1].Value[0] - '0';
+                Log.Verbose = true; // an explicit diag request re-enables logging even in Release
                 Log.W($"DIAG MODE {DiagMode} enabled (auto-exit after 6s)");
             }
         }
@@ -1044,14 +1072,18 @@ internal static class Program
         {
             Log.Ex("Main", ex);
             MessageBox.Show($"{ex.GetType().Name}: {ex.Message}\n\nDetails in log:\n{Log.Path}",
-                "ShaderSaver error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                "WinGLSLScrSaver error", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
     private static void ShowConfig()
     {
         Log.W("Showing config dialog");
-        Application.Run(new ConfigDialog());
+        // ShowDialog (not Application.Run): with a modeless main form the
+        // OK/Cancel buttons never closed the dialog and DialogResult stayed
+        // None, so no config file was ever written. ShowDialog gives the
+        // buttons their normal semantics; saving still happens OnFormClosed.
+        new ConfigDialog().ShowDialog();
         Log.W("Config dialog closed");
     }
 
@@ -1059,26 +1091,33 @@ internal static class Program
     private static string LoadShaderText()
     {
         string saved = Settings.LoadShaderPath();
-        Log.W($"Shader lookup: registry='{saved}'");
+        Log.W($"Shader lookup: config='{saved}'");
         if (!string.IsNullOrWhiteSpace(saved) && File.Exists(saved))
         {
-            Log.W($"Shader source: registry path ({new FileInfo(saved).Length} bytes)");
+            Log.W($"Shader source: configured path ({new FileInfo(saved).Length} bytes)");
             return File.ReadAllText(saved);
         }
 
-        string exeDir = AppContext.BaseDirectory;
-        string def = System.IO.Path.Combine(exeDir, "shader.fs");
-        Log.W($"Shader lookup: checking '{def}' exists={File.Exists(def)}");
-        if (File.Exists(def))
+        // Nothing configured: search %localappdata%\WinGLSLScrSaver\ - the same
+        // folder the config file lives in. The exe's own folder is intentionally
+        // NOT searched (single-file apps extract to %TEMP%; that path is not
+        // meaningful to end users).
+        try
         {
-            Log.W("Shader source: shader.fs next to exe");
-            return File.ReadAllText(def);
+            string dir = Settings.AppDataDir;
+            Log.W($"Shader lookup: not configured, searching {dir}");
+            string first = Directory.Exists(dir)
+                ? Directory.GetFiles(dir, "*.fs").FirstOrDefault()
+                  ?? Directory.GetFiles(dir, "*.glsl").FirstOrDefault()
+                  ?? Directory.GetFiles(dir, "*.frag").FirstOrDefault()
+                : null;
+            if (first != null)
+            {
+                Log.W($"Shader source: found in local app data ({new FileInfo(first).Length} bytes)");
+                return File.ReadAllText(first);
+            }
         }
-
-        string first = Directory.GetFiles(exeDir, "*.fs").FirstOrDefault()
-                       ?? Directory.GetFiles(exeDir, "*.glsl").FirstOrDefault();
-        Log.W($"Shader lookup: any .fs/.glsl next to exe = '{first ?? "(none)"}'");
-        if (first != null) return File.ReadAllText(first);
+        catch { }
 
         Log.W("Shader source: EMBEDDED default swirl (no file found)");
         return ShaderAdapter.DefaultShader;
@@ -1107,20 +1146,25 @@ void main()
             : ShaderAdapter.FragmentHeader + ShaderAdapter.Adapt(shaderText);
         Log.W($"Fragment shader prepared: {fragmentShader.Length} chars total (diagMode={Program.DiagMode})");
 
-        // Dump the EXACT fragment source to the working dir for inspection.
-        try
+        // Dump the EXACT fragment source for inspection (debug aid only -
+        // skipped in silent Release runs). Goes to %localappdata% too.
+        if (Log.Verbose)
         {
-            File.WriteAllText(System.IO.Path.Combine(Environment.CurrentDirectory, "ss_fragment_dump.fs"), fragmentShader);
-            Log.W("Fragment dump written to ss_fragment_dump.fs (cwd)");
+            try
+            {
+                Directory.CreateDirectory(Settings.AppDataDir);
+                File.WriteAllText(System.IO.Path.Combine(Settings.AppDataDir, "ss_fragment_dump.fs"), fragmentShader);
+                Log.W("Fragment dump written to %localappdata%\\WinGLSLScrSaver\\ss_fragment_dump.fs");
+            }
+            catch (Exception ex) { Log.W($"Fragment dump failed: {ex.Message}"); }
         }
-        catch (Exception ex) { Log.W($"Fragment dump failed: {ex.Message}"); }
 
         var windows = new List<RenderWindow>();
 
         if (preview)
         {
             Log.W($"Preview window bounds: {previewBounds}");
-            var win = new RenderWindow(previewBounds, "ShaderSaver Preview",
+            var win = new RenderWindow(previewBounds, "WinGLSLScrSaver Preview",
                 new Size(previewBounds.Width, previewBounds.Height),
                 new Rectangle(0, 0, previewBounds.Width, previewBounds.Height),
                 new Point(0, 0),
@@ -1151,7 +1195,7 @@ void main()
         {
             foreach (var rect in group.Screens)
             {
-                windows.Add(new RenderWindow(rect, "ShaderSaver",
+                windows.Add(new RenderWindow(rect, "WinGLSLScrSaver",
                     new Size(masterW, masterH), group.Bbox,
                     new Point(rect.X - group.Bbox.X, rect.Y - group.Bbox.Y),
                     isPreview: false, inputExit: true));
@@ -1266,7 +1310,7 @@ void main()
     // ---- /s ----
     private static void RunFullscreen()
     {
-        using var mutex = new Mutex(true, @"Local\ShaderSaverRunning", out bool createdNew);
+        using var mutex = new Mutex(true, @"Local\WinGLSLScrSaverRunning", out bool createdNew);
         Log.W($"Fullscreen: mutex createdNew={createdNew}");
         if (!createdNew)
         {
