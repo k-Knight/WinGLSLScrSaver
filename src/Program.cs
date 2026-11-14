@@ -31,6 +31,9 @@ internal static class Program
 {
     private static bool _running = true;
 
+    // Loaded once at startup; the /c dialog edits and saves this object.
+    internal static AppSettings Cfg;
+
     // --diag=1: gradient to backbuffer (blit path)   --diag=2: solid red into
     // RT, blitted normally (RT path)   --diag=3: full pipeline + frame logs.
     // --diag=4: gradient + debug layer + info queue dump + pixel readback.
@@ -59,6 +62,8 @@ internal static class Program
 
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+
+        Cfg = AppSettings.Load();
 
         // Parse arguments (case-insensitive; "/p12345" and "/p 12345" both ok).
         string mode = "";
@@ -140,7 +145,7 @@ internal static class Program
     // the folder is gone/empty), else the embedded default.
     private static string LoadShaderText()
     {
-        string folder = Settings.LoadShaderFolder();
+        string folder = Cfg.ShaderFolder;
         if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
             folder = Settings.AppDataDir;
 
@@ -160,12 +165,15 @@ internal static class Program
     {
         try
         {
-            return Directory.Exists(folder)
-                ? Directory.GetFiles(folder, "*.fs")
-                    .Concat(Directory.GetFiles(folder, "*.glsl"))
-                    .Concat(Directory.GetFiles(folder, "*.frag"))
-                    .ToArray()
-                : Array.Empty<string>();
+            if (!Directory.Exists(folder)) return Array.Empty<string>();
+            // Exclude our own debug fragment dump: it lives in the same folder
+            // and is NOT a shader - picking it up re-compiles the fragment
+            // header (fragTexCoord/Uniforms redefinition -> black screen).
+            return Directory.GetFiles(folder, "*.fs")
+                .Concat(Directory.GetFiles(folder, "*.glsl"))
+                .Concat(Directory.GetFiles(folder, "*.frag"))
+                .Where(f => !System.IO.Path.GetFileName(f).Equals("ss_fragment_dump.fs", StringComparison.OrdinalIgnoreCase))
+                .ToArray();
         }
         catch { return Array.Empty<string>(); }
     }
@@ -215,7 +223,8 @@ void main()
                 new Size(previewBounds.Width, previewBounds.Height),
                 new Rectangle(0, 0, previewBounds.Width, previewBounds.Height),
                 new Point(0, 0),
-                isPreview: true, inputExit: false);
+                isPreview: true, inputExit: false,
+                resMult: Cfg.ResMult, scaleBlend: Cfg.ScaleBlend);
             windows.Add(win);
             return windows;
         }
@@ -245,7 +254,8 @@ void main()
                 windows.Add(new RenderWindow(rect, "WinGLSLScrSaver",
                     new Size(masterW, masterH), group.Bbox,
                     new Point(rect.X - group.Bbox.X, rect.Y - group.Bbox.Y),
-                    isPreview: false, inputExit: true));
+                    isPreview: false, inputExit: true,
+                    resMult: Cfg.ResMult, scaleBlend: Cfg.ScaleBlend));
             }
         }
         Log.W($"Windows created: {windows.Count}");
@@ -270,7 +280,22 @@ void main()
         return best;
     }
 
-    private static void RunLoop(List<RenderWindow> windows, int targetFps)
+    // Effective render-loop FPS cap: 0 (auto) = uncapped pacing at the
+    // fastest display's refresh - exactly today's behavior. Otherwise clamp
+    // to 1..max(highest monitor refresh, 120): above the fastest refresh no
+    // scan-out ever picks the frames up, so there is nothing to gain.
+    private static int EffectiveFpsCap(int fastestRefresh)
+    {
+        int cap = Cfg.FpsCap;
+        if (cap <= 0) return 0;
+        int upper = Math.Max(fastestRefresh, 120);
+        int eff = Math.Clamp(cap, 1, upper);
+        if (eff != cap) Log.W($"FPS cap {cap} clamped to {eff} (1..{upper})");
+        Log.W($"FPS cap: {eff} (setting={cap}, max={upper})");
+        return eff;
+    }
+
+    private static void RunLoop(List<RenderWindow> windows, int targetFps, int fpsCap = 0)
     {
         // Init graphics BEFORE showing: the device still binds to the final
         // window handle (created on demand here; preview reparenting already
@@ -291,10 +316,18 @@ void main()
         foreach (var w in windows) w.Show();
         if (windows.Count > 0 && !windows[0].IsPreview)
             windows[0].Activate();
-        Log.W("All windows shown");
+        // With an FPS cap the loop is paced by the timer, so presents must not
+        // block on vblank (Present(0), tearing accepted); auto mode keeps vsync.
+        foreach (var w in windows) w.PresentInterval = fpsCap > 0 ? 0 : 1;
+        Log.W($"All windows shown (presentInterval={(fpsCap > 0 ? 0 : 1)})");
 
         var sw = Stopwatch.StartNew();
         var frame = TimeSpan.FromMilliseconds(1000.0 / targetFps);
+        // fpsCap > 0: pace the loop with a high-resolution waitable timer.
+        // Sleep(1) alone is unreliable here - since Win10 2004 the raised
+        // timer resolution only applies to the FOCUSED process, and a
+        // screensaver never has focus.
+        var capFrame = fpsCap > 0 ? TimeSpan.FromMilliseconds(1000.0 / fpsCap) : TimeSpan.Zero;
         double diagSeconds = Program.DiagMode > 0 ? 6.0 : double.PositiveInfinity;
         long frames = 0;
 
@@ -328,17 +361,38 @@ void main()
             if (frames == 1) Log.W("First frame rendered");
             if (frames % 600 == 0) Log.W($"Heartbeat: {frames} frames, t={t:F1}s");
 
-            var elapsed = sw.Elapsed;
-            var nextFrame = TimeSpan.FromTicks((long) Math.Ceiling(elapsed.Ticks / (double) frame.Ticks) * frame.Ticks);
-            var remain = nextFrame - elapsed;
-            while (remain > TimeSpan.Zero && _running)
+            if (fpsCap > 0)
             {
-                if (remain > TimeSpan.FromMilliseconds(2))
-                    Thread.Sleep(1);
-                else
-                    Thread.SpinWait(50);
-                elapsed = sw.Elapsed;
-                remain = nextFrame - elapsed;
+                // High-res timer pacing to the next cap boundary.
+                var elapsed = sw.Elapsed;
+                var nextFrame = TimeSpan.FromTicks((long) Math.Ceiling(elapsed.Ticks / (double) capFrame.Ticks) * capFrame.Ticks);
+                var remain = nextFrame - elapsed;
+                if (remain > TimeSpan.Zero)
+                {
+                    // Pump messages while waiting so input/exit stay responsive.
+                    var until = DateTime.UtcNow + remain;
+                    while (DateTime.UtcNow < until && _running)
+                    {
+                        Application.DoEvents();
+                        var left = until - DateTime.UtcNow;
+                        if (left > TimeSpan.FromMilliseconds(2)) Native.SleepHighRes(left);
+                    }
+                }
+            }
+            else
+            {
+                var elapsed = sw.Elapsed;
+                var nextFrame = TimeSpan.FromTicks((long) Math.Ceiling(elapsed.Ticks / (double) frame.Ticks) * frame.Ticks);
+                var remain = nextFrame - elapsed;
+                while (remain > TimeSpan.Zero && _running)
+                {
+                    if (remain > TimeSpan.FromMilliseconds(2))
+                        Thread.Sleep(1);
+                    else
+                        Thread.SpinWait(50);
+                    elapsed = sw.Elapsed;
+                    remain = nextFrame - elapsed;
+                }
             }
         }
 
@@ -383,7 +437,7 @@ void main()
                 return;
             }
             int fps = GetFastestRefresh(preview: false);
-            RunLoop(windows, fps);
+            RunLoop(windows, fps, EffectiveFpsCap(fps));
         }
         finally
         {
@@ -419,6 +473,8 @@ void main()
             new IntPtr(Native.WS_CHILD | Native.WS_VISIBLE));
         Log.W($"Preview: SetWindowLong result={styleResult.ToInt64()}");
 
-        RunLoop(windows, GetFastestRefresh(preview: true));
+        // Preview: keep the current default (uncapped vsync pacing).
+        RunLoop(windows, GetFastestRefresh(preview: true), 0);
     }
 }
+

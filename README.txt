@@ -11,8 +11,18 @@ How shaders are chosen (a fresh random pick on every start):
     2. If not configured or the folder is gone/empty: a random shader from
        %localappdata%\WinGLSLScrSaver\
     3. Otherwise an embedded default swirl shader.
-The /c dialog edits the shader FOLDER (folder browser, defaults to
-%localappdata%\WinGLSLScrSaver).
+The /c dialog edits (all stored in config.txt):
+    - shader FOLDER (folder browser, defaults to %localappdata%\WinGLSLScrSaver)
+    - FPS cap (0 = auto: vsync-paced at the fastest display's refresh;
+      when set, the loop is paced by a high-resolution waitable timer and
+      presents without vsync, clamped to 1..max(highest refresh, 120))
+    - resolution multiplier (5%..100% of native; below 100% the shader
+      renders into a smaller target that is upscaled to the screen -
+      per-monitor aspect ratio is preserved, nothing is stretched)
+    - upscale filtering (nearest/sharp <-> bilinear/smooth, applied when
+      the multiplier is below 100%)
+config.txt is key=value lines; a legacy file holding just the folder
+path is still read correctly.
 
 Logs and debug dumps (DEBUG builds and --diag runs only - Release is silent:
 no log file, no dump, zero per-call file I/O):
@@ -42,3 +52,4 @@ x64 PC with nothing installed.
 
 Install for testing: right-click WinGLSLScrSaver.scr -> Install,
 or copy it to C:\Windows\System32.
+

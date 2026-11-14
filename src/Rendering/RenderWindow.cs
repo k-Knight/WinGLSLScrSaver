@@ -26,6 +26,11 @@ internal class RenderWindow : Form
     private readonly SizeF _fitted;         // fitted image size in group canvas
     private readonly PointF _letterbox;     // fitted image offset in group canvas
 
+    // Scaled-path settings (Program-level config, per-window copy).
+    private readonly float _resMult;        // 0.05..1.0; < 1 = render small, upscale
+    private readonly float _scaleBlend;     // 0 = nearest, 1 = bilinear, between = mix
+    private bool ScaledPath => _resMult < 1f && _rt != null;
+
     private GraphicsDevice _device;
     private Shader _mainShader;
     private Shader _blitShader;
@@ -40,6 +45,9 @@ internal class RenderWindow : Form
     private Texture _rt;
     private Framebuffer _fb;
     private SamplerState _sampler;
+    private SamplerState _pointSampler;   // scaled path: nearest neighbour
+    private GraphicsBuffer _blitQuadStatic; // scaled path: static fullscreen blit quad
+    private int _rtW, _rtH;               // scaled path RT size (Texture has no size query)
     private bool _disposed;
 
     private static readonly Vector2[] QuadVertices =
@@ -61,6 +69,12 @@ internal class RenderWindow : Form
 
     public bool ShutdownRequested { get; private set; }
 
+    // 1 = present with vsync (auto mode, today's behavior); 0 = present
+    // immediately without blocking (used when an FPS cap is set, so the
+    // render loop is paced purely by the cap - monitors sample the latest
+    // buffer at their own refresh). Set by RunLoop before the loop starts.
+    public int PresentInterval = 1;
+
     private static Cursor _hiddenCursor;
 
     private static Cursor HiddenCursor()
@@ -75,7 +89,8 @@ internal class RenderWindow : Form
     // Constructor does ONLY window setup - no Handle access, no GPU work.
     public RenderWindow(Rectangle bounds, string title, Size master,
                         Rectangle groupBbox, Point offsetInGroup,
-                        bool isPreview, bool inputExit)
+                        bool isPreview, bool inputExit,
+                        float resMult = 1f, float scaleBlend = 0.5f)
     {
         IsPreview = isPreview;
         AllowInputExit = inputExit && !isPreview;
@@ -96,13 +111,16 @@ internal class RenderWindow : Form
         _master = master;
         _groupBbox = groupBbox;
         _offsetInGroup = offsetInGroup;
+        _resMult = Math.Clamp(resMult, AppSettings.MinResMult, AppSettings.MaxResMult);
+        _scaleBlend = Math.Clamp(scaleBlend, 0f, 1f);
 
         float scale = Math.Min((float) groupBbox.Width / master.Width, (float) groupBbox.Height / master.Height);
         _fitted = new SizeF(master.Width * scale, master.Height * scale);
         _letterbox = new PointF((groupBbox.Width - _fitted.Width) / 2f, (groupBbox.Height - _fitted.Height) / 2f);
 
         Log.W($"RenderWindow created: bounds={bounds} master={master} groupBbox={groupBbox} " +
-              $"offset={offsetInGroup} fitted={_fitted} letterbox={_letterbox} preview={isPreview}");
+              $"offset={offsetInGroup} fitted={_fitted} letterbox={_letterbox} preview={isPreview} " +
+              $"resMult={_resMult:0.###} scaleBlend={_scaleBlend:0.###}");
     }
 
     // Call AFTER the form is shown (and reparented, for preview).
@@ -145,15 +163,26 @@ void main()
     gl_Position = vec4(aPosUv.xy, 0.0, 1.0);
 }";
 
-            const string BlitFragment = @"
+            // Blit fragment with the interpolation blend BAKED IN as a compile
+            // constant (the setting is fixed for the whole run, and a spec
+            // constant would have to survive shaderc -> SPIRV-Cross -> HLSL -
+            // not worth the risk). 0 = pure nearest neighbour, 1 = pure
+            // bilinear; between = per-pixel weighted mix of the two.
+            // NOTE: the blend is formatted with "0.0###" (not "0.####") - GLSL
+            // forbids a bare "0f"/"1f"; a float literal needs a decimal point
+            // or exponent, so 0 and 1 must come out as 0.0 / 1.0.
+            string BlitFragment = $@"
 #version 450
 layout (location = 0) in vec2 vUv;
 layout (location = 0) out vec4 oColor;
-layout (binding = 0) uniform sampler2D uTex;
+layout (binding = 0) uniform sampler2D uTexLinear;  // bilinear filtered
+layout (binding = 1) uniform sampler2D uTexPoint;   // nearest neighbour
 void main()
-{
-    oColor = texture(uTex, vUv);
-}";
+{{
+    vec4 lin = texture(uTexLinear, vUv);
+    vec4 nn  = texture(uTexPoint, vUv);
+    oColor = mix(nn, lin, {_scaleBlend.ToString("0.0###", System.Globalization.CultureInfo.InvariantCulture)}f);
+}}";
 
             const string GradientBlitFragment = @"
 #version 450
@@ -164,7 +193,7 @@ void main()
     oColor = vec4(vUv.x, vUv.y, 0.2, 1.0);
 }";
             string blitFrag = Program.DiagMode is 1 or 4 or 6 ? GradientBlitFragment : BlitFragment;
-            Log.W($"InitGraphics: blit shader = {(Program.DiagMode is 1 or 4 or 6 ? "GRADIENT (diag1/4/6)" : "texture blit")}");
+            Log.W($"InitGraphics: blit shader = {(Program.DiagMode is 1 or 4 or 6 ? "GRADIENT (diag1/4/6)" : $"texture blit (blend={_scaleBlend:0.###})")}");
 
             _blitShader = _device.CreateShader(new[]
             {
@@ -179,9 +208,11 @@ void main()
             _indexBuffer = _device.CreateBuffer(BufferType.IndexBuffer, QuadIndices);
             _uniform = _device.CreateBuffer(BufferType.UniformBuffer, Vector4.Zero, true);
 
-            // RT / blit machinery is only needed by --diag modes now; the normal
-            // path renders the shader straight to the backbuffer (single pass).
-            if (Program.DiagMode != 0)
+            // RT / blit machinery is needed by --diag modes AND by the scaled
+            // path (res_mult < 1.0: shader renders into a smaller RT that is
+            // upscaled to the screen by the blit pass). At res_mult == 1.0
+            // with no diag the normal path renders straight to the backbuffer.
+            if (Program.DiagMode != 0 || _resMult < 1f)
             {
                 _blitVb = _device.CreateBuffer(BufferType.VertexBuffer, ComputeBlitVerts());
                 // DIAG 6: static control buffer (kept for repro runs).
@@ -193,10 +224,30 @@ void main()
                     new(new Vector2(-1f,  1f), new Vector2(0f, 0f)),
                 });
 
-                _rt = _device.CreateTexture(TextureDescription.Texture2D(_master.Width, _master.Height,
+                // Scaled path: RT at client size x multiplier, plus a static
+                // fullscreen quad (CW winding) and the two samplers. The blit
+                // VB is STATIC because Pie 0.10.1's UpdateBuffer on dynamic
+                // vertex buffers silently fails (the original black-screen
+                // bug) - never fill a dynamic VB per frame.
+                int rtW = Math.Max(1, (int) Math.Round(ClientSize.Width * _resMult));
+                int rtH = Math.Max(1, (int) Math.Round(ClientSize.Height * _resMult));
+                // Diag 5/6 need the master-size RT for their pixel readbacks;
+                // every other mode (incl. the real scaled path) uses client x mult.
+                if (Program.DiagMode is 5 or 6) { rtW = _master.Width; rtH = _master.Height; }
+                _rtW = rtW; _rtH = rtH;
+                _rt = _device.CreateTexture(TextureDescription.Texture2D(rtW, rtH,
                     Format.R8G8B8A8_UNorm, 1, 1, TextureUsage.Framebuffer | TextureUsage.ShaderResource));
                 _fb = _device.CreateFramebuffer(new FramebufferAttachment(_rt));
                 _sampler = _device.CreateSamplerState(SamplerStateDescription.LinearClamp);
+                _pointSampler = _device.CreateSamplerState(SamplerStateDescription.PointClamp);
+                _blitQuadStatic = _device.CreateBuffer(BufferType.VertexBuffer, new VPosUv[4]
+                {
+                    new(new Vector2( 1f,  1f), new Vector2(1f, 0f)), // top-right
+                    new(new Vector2( 1f, -1f), new Vector2(1f, 1f)), // bottom-right
+                    new(new Vector2(-1f, -1f), new Vector2(0f, 1f)), // bottom-left
+                    new(new Vector2(-1f,  1f), new Vector2(0f, 0f)), // top-left
+                });
+                Log.W($"InitGraphics: scaled path RT {rtW}x{rtH} (mult={_resMult:0.###}, blend={_scaleBlend:0.###})");
             }
 
             // Hide the cursor only after everything initialized (fullscreen).
@@ -245,8 +296,8 @@ void main()
         _disposed = true;
         try
         {
-            _rt?.Dispose(); _fb?.Dispose(); _sampler?.Dispose();
-            _blitVb?.Dispose(); _blitVbStatic?.Dispose();
+            _rt?.Dispose(); _fb?.Dispose(); _sampler?.Dispose(); _pointSampler?.Dispose();
+            _blitVb?.Dispose(); _blitVbStatic?.Dispose(); _blitQuadStatic?.Dispose();
             _quadVb?.Dispose(); _indexBuffer?.Dispose(); _uniform?.Dispose();
             _mainLayout?.Dispose(); _blitLayout?.Dispose();
             _mainShader?.Dispose(); _blitShader?.Dispose(); _depthDisabled?.Dispose();
@@ -393,7 +444,45 @@ void main()
             return;
         }
 
-        // ---- Single-pass direct rendering (crop-to-fill).
+        // ---- Scaled path (res_mult < 1.0): Pass A renders the shader into the
+        // small RT, Pass B upscales it to the backbuffer with the blended
+        // sampler (nearest <-> bilinear). Both vertex buffers are STATIC -
+        // Pie 0.10.1's UpdateBuffer on dynamic VBs silently fails.
+        if (ScaledPath)
+        {
+            int rtW = _rtW, rtH = _rtH;
+
+            // Pass A: shader into RT at the monitor's own aspect ratio.
+            _device.SetFramebuffer(_fb);
+            _device.Viewport = new Rectangle(0, 0, rtW, rtH);
+            _device.UpdateBuffer(_uniform, 0, new Vector4(rtW, rtH, 1f, time));
+            _device.SetShader(_mainShader);
+            _device.SetUniformBuffer(0u, _uniform);
+            _device.SetDepthStencilState(_depthDisabled);
+            _device.SetPrimitiveType(PrimitiveType.TriangleList);
+            _device.SetInputLayout(_mainLayout);
+            _device.SetVertexBuffer(0u, _quadVb, 8u);
+            _device.SetIndexBuffer(_indexBuffer, IndexType.UInt);
+            _device.DrawIndexed(6u);
+
+            // Pass B: upscale RT to the screen with both samplers blended.
+            _device.SetFramebuffer(null);
+            _device.Viewport = new Rectangle(0, 0, w, h);
+            _device.SetShader(_blitShader);
+            _device.SetTexture(0u, _rt, _sampler);        // bilinear
+            _device.SetTexture(1u, _rt, _pointSampler);   // nearest neighbour
+            _device.SetDepthStencilState(_depthDisabled);
+            _device.SetPrimitiveType(PrimitiveType.TriangleList);
+            _device.SetInputLayout(_blitLayout);
+            _device.SetVertexBuffer(0u, _blitQuadStatic, 16u);
+            _device.SetIndexBuffer(_indexBuffer, IndexType.UInt);
+            _device.DrawIndexed(6u);
+
+            _device.Present(PresentInterval);
+            return;
+        }
+
+        // ---- Single-pass direct rendering (crop-to-fill, res_mult == 1.0).
         // The shader renders at THIS monitor's native resolution and fills it
         // edge-to-edge - uv 0..1 spans the whole screen, exactly like
         // ShaderRunner fullscreen. No shared max-resolution canvas, no
@@ -419,9 +508,11 @@ void main()
         _device.SetIndexBuffer(_indexBuffer, IndexType.UInt);
         _device.DrawIndexed(6u);
 
-        _device.Present(1); // VSYNC - Present(0)+AllowTearing silently fails on some
-                            // drivers (Pie ignores the DXGI result), leaving black screens.
-                            // ShaderRunner always used Present(1) and always displayed.
+        _device.Present(PresentInterval); // Auto mode = 1 (vsync): Present(0)+AllowTearing
+                            // silently fails on some drivers (Pie ignores the DXGI
+                            // result), leaving black screens. With an FPS cap set the
+                            // interval is 0 and pacing is the loop's job - tearing is
+                            // accepted there by design.
     }
 
     // Builds the blit quad vertices for the current client size and letterbox
@@ -583,7 +674,22 @@ void main()
                 _blitVb = _device.CreateBuffer(BufferType.VertexBuffer, ComputeBlitVerts());
                 Log.W($"OnResize: blit VB rebuilt for {ClientSize.Width}x{ClientSize.Height}");
             }
+            // Scaled path: rebuild the RT at client size x multiplier so the
+            // resolution multiplier keeps applying at the new window size.
+            if (_device != null && _rt != null && _resMult < 1f && Program.DiagMode == 0)
+            {
+                int rtW = Math.Max(1, (int) Math.Round(ClientSize.Width * _resMult));
+                int rtH = Math.Max(1, (int) Math.Round(ClientSize.Height * _resMult));
+                _rt.Dispose();
+                _fb.Dispose();
+                _rt = _device.CreateTexture(TextureDescription.Texture2D(rtW, rtH,
+                    Format.R8G8B8A8_UNorm, 1, 1, TextureUsage.Framebuffer | TextureUsage.ShaderResource));
+                _fb = _device.CreateFramebuffer(new FramebufferAttachment(_rt));
+                _rtW = rtW; _rtH = rtH;
+                Log.W($"OnResize: scaled RT rebuilt {rtW}x{rtH}");
+            }
         }
         catch (Exception ex) { Log.Ex("OnResize/ResizeSwapchain", ex); }
     }
 }
+

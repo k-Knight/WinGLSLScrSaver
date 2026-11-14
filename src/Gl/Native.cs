@@ -77,4 +77,48 @@ internal static class Native
 
     internal static IntPtr SetWindowLong(IntPtr hwnd, int index, IntPtr value)
         => IntPtr.Size == 8 ? SetWindowLongPtr64(hwnd, index, value) : (IntPtr)SetWindowLong32(hwnd, index, (int)value);
+
+    // ---- high-resolution waitable timer (FPS pacing) ----
+    // Sleep(1) granularity depends on the system timer resolution, which
+    // since Windows 10 2004 is only raised for the FOCUSED process - a
+    // screensaver never has focus, so Sleep-based pacing degrades to
+    // ~15.6ms ticks. A HIGH_RESOLUTION waitable timer keeps ~0.5ms
+    // precision regardless of focus (Windows 10 1803+).
+    private const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
+    private const long TIMER_QUERY_TICKS = -1;      // relative due time
+    private const uint WAIT_OBJECT_0 = 0;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateWaitableTimerExW(IntPtr attrs, string name,
+        uint flags, uint desiredAccess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetWaitableTimer(IntPtr timer, ref long dueTime,
+        int period, IntPtr completionRoutine, IntPtr arg, bool resume);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint ms);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    internal static void SleepHighRes(TimeSpan t)
+    {
+        if (t <= TimeSpan.Zero) return;
+        IntPtr timer = CreateWaitableTimerExW(IntPtr.Zero, null,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, 0x1FFFFF /* TIMER_ALL_ACCESS */);
+        if (timer == IntPtr.Zero)
+        {
+            // Pre-1803 fallback: coarse sleep.
+            System.Threading.Thread.Sleep((int) t.TotalMilliseconds);
+            return;
+        }
+        // Due time is in 100ns units, negative = relative; TimeSpan ticks are
+        // also 100ns, so the value maps 1:1.
+        long due = -t.Ticks;
+        SetWaitableTimer(timer, ref due, 0, IntPtr.Zero, IntPtr.Zero, false);
+        WaitForSingleObject(timer, uint.MaxValue);
+        CloseHandle(timer);
+    }
 }
+
