@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>ShaderSaver</AssemblyName>
+    <RootNamespace>ShaderSaver</RootNamespace>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Pie" Version="0.10.1" />
+    <PackageReference Include="Vortice.Direct3D11" Version="3.3.4" />
+    <PackageReference Include="Vortice.D3DCompiler" Version="3.3.4" />
+  </ItemGroup>
+
+</Project>

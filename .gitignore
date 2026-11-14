@@ -1,0 +1,18 @@
+# Build output: the .scr, the default shader and build logs all live here
+publish/
+
+# .NET build intermediates
+src/bin/
+src/obj/
+*.user
+
+# Runtime logs from screensaver test runs
+shadersaver.log
+build_log.txt
+
+# IDE / editor
+.vs/
+.idea/
+
+# Runtime fragment-shader dump (written next to the exe for debugging)
+ss_fragment_dump.fs
