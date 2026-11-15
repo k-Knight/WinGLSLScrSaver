@@ -302,9 +302,28 @@ void main()
         // happened in RunPreview), and the first frame is on the swapchain by
         // the time the window becomes visible - no white flash at startup.
         int okCount = 0;
-        foreach (var w in windows)
-            if (w.InitGraphics(VertexShaderStatic, FragmentShaderStatic))
+        if ((Program.DiagMode == 0 || Program.DiagMode == 7) && windows.Count > 0)
+        {
+            // Shared canvas architecture: window 0 hosts the (only) device and
+            // renders the shader once per frame into the canvas; the rest are
+            // raw DXGI swapchain windows blitting their slice on that device.
+            // Diag 7 uses the same pipeline, plus backbuffer pixel dumps.
+            windows[0].IsCanvasOwner = true;
+            if (windows[0].InitGraphics(VertexShaderStatic, FragmentShaderStatic))
+            {
                 okCount++;
+                for (int i = 1; i < windows.Count; i++)
+                    if (windows[i].InitRawGraphics(windows[0]))
+                        okCount++;
+            }
+        }
+        else
+        {
+            // --diag modes keep the per-window devices (pixel readbacks etc.).
+            foreach (var w in windows)
+                if (w.InitGraphics(VertexShaderStatic, FragmentShaderStatic))
+                    okCount++;
+        }
         Log.W($"Graphics initialized on {okCount}/{windows.Count} windows");
 
         if (okCount == 0)
@@ -328,7 +347,8 @@ void main()
         // timer resolution only applies to the FOCUSED process, and a
         // screensaver never has focus.
         var capFrame = fpsCap > 0 ? TimeSpan.FromMilliseconds(1000.0 / fpsCap) : TimeSpan.Zero;
-        double diagSeconds = Program.DiagMode > 0 ? 6.0 : double.PositiveInfinity;
+        double diagSeconds = Program.DiagMode == 7 ? 4.0
+            : Program.DiagMode > 0 ? 6.0 : double.PositiveInfinity;
         long frames = 0;
 
         while (_running)

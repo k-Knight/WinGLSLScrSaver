@@ -41,13 +41,24 @@ internal class ScreenGroup
         return groups;
     }
 
+    // Monitors that tile a rectangle nearly perfectly are merged into one
+    // group and treated as one monitor - the shared canvas then spans them
+    // seamlessly. A 1% tolerance (of the smaller screen's size) absorbs
+    // coordinate rounding from drivers, DPI scaling and bezel compensation.
     private static bool FlushAdjacent(Rectangle a, Rectangle b)
     {
-        if (a.Right == b.Left || b.Right == a.Left)          // side by side
-            return a.Top == b.Top && a.Bottom == b.Bottom;
-        if (a.Bottom == b.Top || b.Bottom == a.Top)          // stacked
-            return a.Left == b.Left && a.Right == b.Right;
-        return false;
+        double tolX = Math.Min(a.Width, b.Width) * 0.01;
+        double tolY = Math.Min(a.Height, b.Height) * 0.01;
+
+        bool sideBySide =
+            (Math.Abs(a.Right - b.Left) <= tolX || Math.Abs(b.Right - a.Left) <= tolX) &&
+            Math.Abs(a.Top - b.Top) <= tolY && Math.Abs(a.Bottom - b.Bottom) <= tolY;
+        if (sideBySide) return true;
+
+        bool stacked =
+            (Math.Abs(a.Bottom - b.Top) <= tolY || Math.Abs(b.Bottom - a.Top) <= tolY) &&
+            Math.Abs(a.Left - b.Left) <= tolX && Math.Abs(a.Right - b.Right) <= tolX;
+        return stacked;
     }
 }
 
