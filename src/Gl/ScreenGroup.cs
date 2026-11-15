@@ -1,10 +1,5 @@
 namespace WinGLSLScrSaver;
 
-using System;
-using System.Collections.Generic;
-using System.Drawing;
-using System.Linq;
-using System.Numerics;
 
 internal class ScreenGroup
 {
@@ -62,8 +57,3 @@ internal class ScreenGroup
     }
 }
 
-internal struct VPosUv
-{
-    public Vector4 Data;
-    public VPosUv(Vector2 pos, Vector2 uv) { Data = new Vector4(pos.X, pos.Y, uv.X, uv.Y); }
-}

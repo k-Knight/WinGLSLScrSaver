@@ -23,7 +23,7 @@ rem   -p:PublishSingleFile=true              one exe, no DLL sprawl
 rem   -p:IncludeNativeLibrariesForSelfExtract=true  native libs inside the exe
 rem   -p:EnableCompressionInSingleFile=true  compressed (~smaller file)
 rem   -p:PublishTrimmed=false                WinForms does not support trimming
-dotnet publish src\WinGLSLScrSaver.csproj -c Release -r win-x64 --self-contained true ^
+dotnet publish WinGLSLScrSaver.csproj -c Release -r win-x64 --self-contained true ^
   -p:PublishSingleFile=true ^
   -p:IncludeNativeLibrariesForSelfExtract=true ^
   -p:EnableCompressionInSingleFile=true ^
@@ -36,6 +36,7 @@ if errorlevel 1 (
 
 del publish\WinGLSLScrSaver.scr >nul 2>nul
 ren publish\WinGLSLScrSaver.exe WinGLSLScrSaver.scr >nul
+del publish\WinGLSLScrSaver.pdb >nul 2>nul
 if exist shaders\shader_techno.fs copy /y shaders\shader_techno.fs publish\shader.fs >nul
 
 echo.

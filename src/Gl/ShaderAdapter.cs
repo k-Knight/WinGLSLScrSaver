@@ -1,7 +1,5 @@
 namespace WinGLSLScrSaver;
 
-using System;
-using System.Numerics;
 using System.Text.RegularExpressions;
 
 internal static class ShaderAdapter

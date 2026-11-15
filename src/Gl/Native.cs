@@ -1,8 +1,5 @@
 namespace WinGLSLScrSaver;
 
-using System;
-using System.Drawing;
-using System.Numerics;
 using System.Runtime.InteropServices;
 
 internal static class Native
@@ -55,6 +52,7 @@ internal static class Native
     internal struct RECT { public int Left, Top, Right, Bottom; }
 
     [DllImport("user32.dll")] internal static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
+    [DllImport("user32.dll")] internal static extern bool IsWindow(IntPtr hwnd);
 
     // Display power management: while the screensaver runs, tell Windows the
     // display is in use so the OS power plan cannot blank a monitor mid-run
@@ -85,8 +83,6 @@ internal static class Native
     // ~15.6ms ticks. A HIGH_RESOLUTION waitable timer keeps ~0.5ms
     // precision regardless of focus (Windows 10 1803+).
     private const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
-    private const long TIMER_QUERY_TICKS = -1;      // relative due time
-    private const uint WAIT_OBJECT_0 = 0;
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr CreateWaitableTimerExW(IntPtr attrs, string name,
@@ -97,7 +93,7 @@ internal static class Native
         int period, IntPtr completionRoutine, IntPtr arg, bool resume);
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern uint WaitForSingleObject(IntPtr handle, uint ms);
+    internal static extern uint WaitForSingleObject(IntPtr handle, uint ms);
 
     [DllImport("kernel32.dll")]
     private static extern bool CloseHandle(IntPtr handle);
@@ -121,4 +117,3 @@ internal static class Native
         CloseHandle(timer);
     }
 }
-

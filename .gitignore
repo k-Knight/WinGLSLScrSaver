@@ -2,8 +2,8 @@
 publish/
 
 # .NET build intermediates
-src/bin/
-src/obj/
+bin/
+obj/
 *.user
 
 # Runtime logs from screensaver test runs

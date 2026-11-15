@@ -7,27 +7,18 @@
 //
 // DEBUG BUILD NOTES:
 //   * DEBUG builds and --diag runs log to %localappdata%\WinGLSLScrSaver\
-//     (falls back to %TEMP%). Release builds are silent: no log file, no
-//     fragment dump, zero per-call file I/O.
+//     (falls back to %TEMP%). Release builds are silent: no log file,
+//     zero per-call file I/O.
 //   * GPU device creation is deferred until AFTER the form is shown and
 //     (for preview) reparented - WinForms recreates window handles when
 //     properties change, which would orphan a device created too early.
 // ===========================================================================
 namespace WinGLSLScrSaver;
 
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Drawing;
-using System.IO;
-using System.Linq;
-using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Runtime.InteropServices;
-using System.Threading;
-using System.Windows.Forms;
 
-internal static class Program
+internal partial class Program
 {
     private static bool _running = true;
 
@@ -36,8 +27,12 @@ internal static class Program
 
     // --diag=1: gradient to backbuffer (blit path)   --diag=2: solid red into
     // RT, blitted normally (RT path)   --diag=3: full pipeline + frame logs.
-    // --diag=4: gradient + debug layer + info queue dump + pixel readback.
+    // --diag=4: gradient + pixel readback.
     internal static int DiagMode = 0;
+
+    // The shared-canvas pipeline: normal runs plus the diag-7 verbose
+    // variant. One named test instead of a repeated DiagMode pattern.
+    internal static bool CanvasPipeline => DiagMode is 0 or 7;
 
     [STAThread]
     private static void Main(string[] args)
@@ -86,6 +81,10 @@ internal static class Program
                 mode = "c";
         }
         if (mode.Length == 0) mode = "c";
+        // A preview hwnd in the args means preview mode, period: never let a
+        // stray /s token (shell verb, wrapper script) escalate this run into
+        // the fullscreen multi-monitor path.
+        if (previewHwnd != IntPtr.Zero) mode = "p";
         Log.W($"mode={mode} previewHwnd=0x{previewHwnd.ToInt64():X}");
 
         // Optional diagnostic flag: --diag=N or /diag:N
@@ -108,7 +107,7 @@ internal static class Program
                     ShowConfig();
                     return;
                 case "p":
-                    if (previewHwnd == IntPtr.Zero)
+                    if (previewHwnd == IntPtr.Zero || !Native.IsWindow(previewHwnd))
                     {
                         Log.W("preview requested but hwnd invalid -> config dialog");
                         ShowConfig();
@@ -166,13 +165,9 @@ internal static class Program
         try
         {
             if (!Directory.Exists(folder)) return Array.Empty<string>();
-            // Exclude our own debug fragment dump: it lives in the same folder
-            // and is NOT a shader - picking it up re-compiles the fragment
-            // header (fragTexCoord/Uniforms redefinition -> black screen).
             return Directory.GetFiles(folder, "*.fs")
                 .Concat(Directory.GetFiles(folder, "*.glsl"))
                 .Concat(Directory.GetFiles(folder, "*.frag"))
-                .Where(f => !System.IO.Path.GetFileName(f).Equals("ss_fragment_dump.fs", StringComparison.OrdinalIgnoreCase))
                 .ToArray();
         }
         catch { return Array.Empty<string>(); }
@@ -200,19 +195,6 @@ void main()
 }"
             : ShaderAdapter.FragmentHeader + ShaderAdapter.Adapt(shaderText);
         Log.W($"Fragment shader prepared: {fragmentShader.Length} chars total (diagMode={Program.DiagMode})");
-
-        // Dump the EXACT fragment source for inspection (debug aid only -
-        // skipped in silent Release runs). Lands in the local app data dir.
-        if (Log.Verbose)
-        {
-            try
-            {
-                Directory.CreateDirectory(Settings.AppDataDir);
-                File.WriteAllText(System.IO.Path.Combine(Settings.AppDataDir, "ss_fragment_dump.fs"), fragmentShader);
-                Log.W($"Fragment dump written to {Path.Combine(Settings.AppDataDir, "ss_fragment_dump.fs")}");
-            }
-            catch (Exception ex) { Log.W($"Fragment dump failed: {ex.Message}"); }
-        }
 
         var windows = new List<RenderWindow>();
 
@@ -251,15 +233,31 @@ void main()
         {
             foreach (var rect in group.Screens)
             {
-                windows.Add(new RenderWindow(rect, "WinGLSLScrSaver",
+                var win = new RenderWindow(rect, "WinGLSLScrSaver",
                     new Size(masterW, masterH), group.Bbox,
                     new Point(rect.X - group.Bbox.X, rect.Y - group.Bbox.Y),
                     isPreview: false, inputExit: true,
-                    resMult: Cfg.ResMult, scaleBlend: Cfg.ScaleBlend));
+                    resMult: Cfg.ResMult, scaleBlend: Cfg.ScaleBlend);
+                // Per-monitor refresh rate for present gating (Option A).
+                var scr = screens.FirstOrDefault(s => s.Bounds == rect);
+                if (scr != null) win.RefreshHz = GetScreenRefreshHz(scr);
+                Log.W($"  window bounds={rect}: refresh={win.RefreshHz:0.#} Hz");
+                windows.Add(win);
             }
         }
         Log.W($"Windows created: {windows.Count}");
         return windows;
+    }
+
+    // One display's current refresh rate (query failure -> 60 Hz fallback).
+    internal static double GetScreenRefreshHz(Screen s)
+    {
+        var dm = new Native.DEVMODE();
+        dm.dmSize = (ushort) Marshal.SizeOf<Native.DEVMODE>();
+        if (Native.EnumDisplaySettings(s.DeviceName, Native.ENUM_CURRENT_SETTINGS, ref dm)
+            && dm.dmDisplayFrequency > 0)
+            return dm.dmDisplayFrequency;
+        return 60.0;
     }
 
     private static int GetFastestRefresh(bool preview)
@@ -268,13 +266,9 @@ void main()
         int best = 60;
         foreach (Screen s in Screen.AllScreens)
         {
-            var dm = new Native.DEVMODE();
-            dm.dmSize = (ushort) Marshal.SizeOf<Native.DEVMODE>();
-            if (Native.EnumDisplaySettings(s.DeviceName, Native.ENUM_CURRENT_SETTINGS, ref dm))
-            {
-                Log.W($"  refresh of {s.DeviceName}: {dm.dmDisplayFrequency} Hz");
-                if (dm.dmDisplayFrequency > best) best = dm.dmDisplayFrequency;
-            }
+            double hz = GetScreenRefreshHz(s);
+            Log.W($"  refresh of {s.DeviceName}: {hz:0.#} Hz");
+            if (hz > best) best = (int) hz;
         }
         Log.W($"Target FPS (fastest display): {best}");
         return best;
@@ -292,136 +286,9 @@ void main()
         int eff = Math.Clamp(cap, 1, upper);
         if (eff != cap) Log.W($"FPS cap {cap} clamped to {eff} (1..{upper})");
         Log.W($"FPS cap: {eff} (setting={cap}, max={upper})");
+        RenderWindow.RawPresentFlagMode = Cfg.RawPresentFlags;
+        Log.W($"Raw present flag mode: {Cfg.RawPresentFlags}");
         return eff;
-    }
-
-    private static void RunLoop(List<RenderWindow> windows, int targetFps, int fpsCap = 0)
-    {
-        // Init graphics BEFORE showing: the device still binds to the final
-        // window handle (created on demand here; preview reparenting already
-        // happened in RunPreview), and the first frame is on the swapchain by
-        // the time the window becomes visible - no white flash at startup.
-        int okCount = 0;
-        if ((Program.DiagMode == 0 || Program.DiagMode == 7) && windows.Count > 0)
-        {
-            // Shared canvas architecture: window 0 hosts the (only) device and
-            // renders the shader once per frame into the canvas; the rest are
-            // raw DXGI swapchain windows blitting their slice on that device.
-            // Diag 7 uses the same pipeline, plus backbuffer pixel dumps.
-            windows[0].IsCanvasOwner = true;
-            if (windows[0].InitGraphics(VertexShaderStatic, FragmentShaderStatic))
-            {
-                okCount++;
-                for (int i = 1; i < windows.Count; i++)
-                    if (windows[i].InitRawGraphics(windows[0]))
-                        okCount++;
-            }
-        }
-        else
-        {
-            // --diag modes keep the per-window devices (pixel readbacks etc.).
-            foreach (var w in windows)
-                if (w.InitGraphics(VertexShaderStatic, FragmentShaderStatic))
-                    okCount++;
-        }
-        Log.W($"Graphics initialized on {okCount}/{windows.Count} windows");
-
-        if (okCount == 0)
-        {
-            Log.W("ABORT: no window initialized graphics");
-            _running = false;
-        }
-
-        foreach (var w in windows) w.Show();
-        if (windows.Count > 0 && !windows[0].IsPreview)
-            windows[0].Activate();
-        // With an FPS cap the loop is paced by the timer, so presents must not
-        // block on vblank (Present(0), tearing accepted); auto mode keeps vsync.
-        foreach (var w in windows) w.PresentInterval = fpsCap > 0 ? 0 : 1;
-        Log.W($"All windows shown (presentInterval={(fpsCap > 0 ? 0 : 1)})");
-
-        var sw = Stopwatch.StartNew();
-        var frame = TimeSpan.FromMilliseconds(1000.0 / targetFps);
-        // fpsCap > 0: pace the loop with a high-resolution waitable timer.
-        // Sleep(1) alone is unreliable here - since Win10 2004 the raised
-        // timer resolution only applies to the FOCUSED process, and a
-        // screensaver never has focus.
-        var capFrame = fpsCap > 0 ? TimeSpan.FromMilliseconds(1000.0 / fpsCap) : TimeSpan.Zero;
-        double diagSeconds = Program.DiagMode == 7 ? 4.0
-            : Program.DiagMode > 0 ? 6.0 : double.PositiveInfinity;
-        long frames = 0;
-
-        while (_running)
-        {
-            Application.DoEvents();
-            if (!_running) break;
-
-            if (sw.Elapsed.TotalSeconds > diagSeconds)
-            {
-                Log.W("DIAG auto-exit reached");
-                break;
-            }
-
-            if (windows.Any(w => w.ShutdownRequested))
-            {
-                Log.W("Exit: input shutdown requested");
-                break;
-            }
-            if (windows.All(w => w.IsDisposed))
-            {
-                Log.W("Exit: all windows closed");
-                break;
-            }
-
-            float t = (float) sw.Elapsed.TotalSeconds;
-            foreach (var w in windows)
-                w.Render(t);
-
-            frames++;
-            if (frames == 1) Log.W("First frame rendered");
-            if (frames % 600 == 0) Log.W($"Heartbeat: {frames} frames, t={t:F1}s");
-
-            if (fpsCap > 0)
-            {
-                // High-res timer pacing to the next cap boundary.
-                var elapsed = sw.Elapsed;
-                var nextFrame = TimeSpan.FromTicks((long) Math.Ceiling(elapsed.Ticks / (double) capFrame.Ticks) * capFrame.Ticks);
-                var remain = nextFrame - elapsed;
-                if (remain > TimeSpan.Zero)
-                {
-                    // Pump messages while waiting so input/exit stay responsive.
-                    var until = DateTime.UtcNow + remain;
-                    while (DateTime.UtcNow < until && _running)
-                    {
-                        Application.DoEvents();
-                        var left = until - DateTime.UtcNow;
-                        if (left > TimeSpan.FromMilliseconds(2)) Native.SleepHighRes(left);
-                    }
-                }
-            }
-            else
-            {
-                var elapsed = sw.Elapsed;
-                var nextFrame = TimeSpan.FromTicks((long) Math.Ceiling(elapsed.Ticks / (double) frame.Ticks) * frame.Ticks);
-                var remain = nextFrame - elapsed;
-                while (remain > TimeSpan.Zero && _running)
-                {
-                    if (remain > TimeSpan.FromMilliseconds(2))
-                        Thread.Sleep(1);
-                    else
-                        Thread.SpinWait(50);
-                    elapsed = sw.Elapsed;
-                    remain = nextFrame - elapsed;
-                }
-            }
-        }
-
-        Log.W($"Render loop ended after {frames} frames");
-        foreach (var w in windows)
-        {
-            try { w.Close(); } catch { }
-        }
-        Log.W("All windows closed, exiting");
     }
 
     // Shader source strings stashed for RunLoop (created in CreateWindows).
@@ -470,9 +337,18 @@ void main()
     private static void RunPreview(IntPtr parentHwnd)
     {
         Log.W($"Preview: parent hwnd=0x{parentHwnd.ToInt64():X}");
-        if (!Native.GetClientRect(parentHwnd, out Native.RECT r))
+        // Single instance: a preview run and a fullscreen run must never
+        // coexist (two instances fighting over the monitors). Same mutex the
+        // /s path takes; this instance exits if any other is running.
+        using var mutex = new Mutex(true, @"Local\WinGLSLScrSaverRunning", out bool previewMutexNew);
+        if (!previewMutexNew)
         {
-            Log.W("Preview: GetClientRect FAILED");
+            Log.W("Preview: another instance already running -> exit");
+            return;
+        }
+        if (!Native.GetClientRect(parentHwnd, out Native.RECT r) || r.Right <= r.Left || r.Bottom <= r.Top)
+        {
+            Log.W("Preview: GetClientRect FAILED or empty rect");
             return;
         }
         Log.W($"Preview: client rect L={r.Left} T={r.Top} R={r.Right} B={r.Bottom}");

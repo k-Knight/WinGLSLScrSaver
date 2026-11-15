@@ -1,7 +1,5 @@
 namespace WinGLSLScrSaver;
 
-using System;
-using System.IO;
 
 internal static class Log
 {

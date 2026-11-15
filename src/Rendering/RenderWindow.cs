@@ -1,21 +1,13 @@
 namespace WinGLSLScrSaver;
 
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Drawing;
-using System.IO;
-using System.Linq;
 using System.Numerics;
 using System.Reflection;
-using System.Runtime.InteropServices;
-using System.Windows.Forms;
 using Pie;
 using Pie.ShaderCompiler;
 using D3D = Vortice.Direct3D11;
 using DXGI = Vortice.DXGI;
 
-internal class RenderWindow : Form
+internal partial class RenderWindow : Form
 {
     public readonly bool IsPreview;
     public readonly bool AllowInputExit;
@@ -58,7 +50,7 @@ internal class RenderWindow : Form
     internal bool IsCanvasOwner;
     private bool _isRawWindow;
     private DXGI.IDXGISwapChain1 _rawSwap;
-    private D3D.ID3D11RenderTargetView _rawRtv;
+    private IntPtr _frameLatencyWaitable;   // DXGI 1.3 frame latency waitable
     private D3D.ID3D11Buffer _rawVb;
     private int _rawBuiltW, _rawBuiltH;
 
@@ -70,7 +62,8 @@ internal class RenderWindow : Form
     internal DXGI.IDXGISwapChain1 RawSwap => _rawSwap;
     // Raw windows blit into their own swapchain's backbuffer. The owner never
     // does a raw blit - it blits its slice through Pie (framebuffer null).
-    internal D3D.ID3D11RenderTargetView RawRtv => _rawRtv;
+    // Flip model: CanvasBlit.Draw fetches the current back buffer (GetBuffer(0))
+    // and creates its RTV per frame - no cached RTV is possible.
     internal D3D.ID3D11Buffer RawVb => _rawVb;
     internal int RawW => ClientSize.Width;
     internal int RawH => ClientSize.Height;
@@ -83,13 +76,23 @@ internal class RenderWindow : Form
     };
     private static readonly uint[] QuadIndices = { 0u, 1u, 3u, 1u, 2u, 3u };
 
+    // The fullscreen blit quad (TR, BR, BL, TL) - one shared definition for
+    // the sites that used to repeat the same literal: the diag-6 control
+    // buffer, the scaled-path static blit quad and the diag 1/4/6 fills.
+    private static readonly VPosUv[] FullscreenQuad = new VPosUv[]
+    {
+        new(new Vector2( 1f,  1f), new Vector2(1f, 0f)), // top-right
+        new(new Vector2( 1f, -1f), new Vector2(1f, 1f)), // bottom-right
+        new(new Vector2(-1f, -1f), new Vector2(0f, 1f)), // bottom-left
+        new(new Vector2(-1f,  1f), new Vector2(0f, 0f)), // top-left
+    };
+
     private double _lastMouseY = -1, _lastMouseX = -1;
     private int _frameLogs;
 
     // DIAG 4 state.
     private object _d3dDevice;
     private D3D.ID3D11Texture2D _backTex;
-    private D3D.ID3D11Texture2D _stagingTex;
     private D3D.ID3D11Texture2D _rtRT;
     private int _diagFrames;
     private bool _diagDone;
@@ -101,6 +104,134 @@ internal class RenderWindow : Form
     // render loop is paced purely by the cap - monitors sample the latest
     // buffer at their own refresh). Set by RunLoop before the loop starts.
     public int PresentInterval = 1;
+
+    // ---- Per-monitor present pacing (Option A, fullscreen canvas runs) ---
+    // The render loop is paced by the fastest display (or fps_cap); every
+    // window gates its own blit+present to its monitor's refresh rate, so a
+    // mixed-refresh setup no longer runs everything at the slowest rate.
+    internal double RefreshHz = 60.0;   // this monitor's actual refresh rate
+    internal bool PresentGating;        // set by RunLoop for fullscreen canvas runs
+    private double _nextPresentDue;     // due time in loop-stopwatch seconds
+    public long PresentFrames;          // presents actually handed to DWM
+    private bool _dwnLogged;            // WasStillDrawing warning (once)
+
+    // ---- Present thread (fix C, present_threads=1) -------------------------
+    // The raw window's Present(0) costs ~one DWM composition period (~5.9ms
+    // on the 170Hz primary) even with DO_NOT_WAIT - the driver syncs the
+    // flip to the composition phase. Running that wait on a dedicated thread
+    // takes it out of the render loop's frame budget. The main thread only
+    // hands off a flag + timestamp; the thread calls the actual DXGI present.
+    // Device-context calls stay on the main thread - D3D11's
+    // immediate context is not thread-safe; swapchain Present is.
+    internal bool UsePresentThread;
+    // True while the present thread is inside a swapchain operation on this
+    // window (LaneDraw's GetBuffer, or Present itself). The main thread must
+    // not touch the same swapchain concurrently: GetBuffer(0) / RTV creation
+    // / ResizeBuffers while a Present is in flight is driver-level undefined
+    // behavior - this is the ~1-in-5 launch AV (c0000005) with present
+    // threads on. The present thread sets/clears it; the main thread waits
+    // briefly and then skips that tick's swapchain access (one stale frame).
+    private volatile bool _presentInFlight;
+    internal bool PresentInFlight => _presentInFlight;
+    private Thread _presentThread;
+    private readonly AutoResetEvent _presentSignal = new(false);
+    private readonly ManualResetEvent _presentExit = new(false);
+    private volatile float _presentThreadTime;
+    private volatile bool _presentQueued;
+
+    // ---- Present lane (present_lanes=2) ------------------------------------
+    // This window's swapchain lives on a SECOND D3D11 device (CanvasBlit lane
+    // device) and its blit+present run there from the present thread - a
+    // fully parallel present lane, bypassing the one-device serialization
+    // that caps the loop at ~83 fps. The canvas crosses devices through a
+    // keyed-mutex shared texture (device1 copies it once per tick).
+    internal bool UseLane;
+    private DXGI.IDXGISwapChain1 _laneSwap;
+    private IntPtr _laneWaitable;
+    private D3D.ID3D11Buffer _laneVb;
+    private int _laneBuiltW, _laneBuiltH;
+    internal DXGI.IDXGISwapChain1 LaneSwap => _laneSwap;
+    internal D3D.ID3D11Buffer LaneVb => _laneVb;
+
+    internal void StartPresentThread()
+    {
+        if (_presentThread != null) return;
+        _presentThread = new Thread(PresentThreadLoop)
+        {
+            IsBackground = true,
+            Name = "present-thread",
+        };
+        _presentThread.Start();
+        Log.W("Present thread started");
+    }
+
+    internal void ShutdownPresentThread(int joinMs)
+    {
+        var t = _presentThread;
+        if (t == null) return;
+        _presentThread = null;
+        _presentExit.Set();
+        _presentSignal.Set();
+        if (!t.Join(joinMs))
+        {
+            Log.W("Present thread did not stop in time (aborting join)");
+            return;
+        }
+        _presentExit.Reset();
+    }
+
+    // Main thread: hand the present off. Coalescing: if the thread is still
+    // busy with the previous present, the event just latches and the next
+    // present happens when it frees up (natural backpressure).
+    private void RequestPresent(float time)
+    {
+        _presentThreadTime = time;
+        _presentQueued = true;
+        _presentSignal.Set();
+    }
+
+    private void PresentThreadLoop()
+    {
+        WaitHandle[] handles = { _presentExit, _presentSignal };
+        while (_presentThread != null)
+        {
+            int which = WaitHandle.WaitAny(handles);
+            if (which == 0 || _presentThread == null) return;
+            if (_presentQueued)
+            {
+                _presentQueued = false;
+                try { PresentCore(_presentThreadTime); }
+                catch (Exception ex) { Log.Ex("PresentThread", ex); }
+            }
+        }
+    }
+
+    private const int DXGI_PRESENT_DO_NOT_WAIT = 0x00000008;
+    private const int DXGI_PRESENT_ALLOW_TEARING = 0x00000200;
+    private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int) 0x887A000A);
+
+    // Cheap per-frame timing probes (read+reset by RunLoop's FPS log): where
+    // does the frame budget actually go - draw, presents, pacing?
+    internal static double OwnerPresentTotalMs;
+    internal static double RawPresentTotalMs;
+    internal static long RawWasStillCount;
+    internal static double RawPresentMinMs = double.MaxValue;
+    internal static double RawPresentMaxMs;
+    internal static double OwnerPresentMinMs = double.MaxValue;
+    internal static double OwnerPresentMaxMs;
+    // Waitable-object wait times (raw windows): should be ~0ms when the
+    // present queue drains faster than we fill it; sustained >0 means the
+    // driver is applying backpressure and we are genuinely queue-limited.
+    internal static double FrameLatencyWaitTotalMs;
+    internal static double FrameLatencyWaitMaxMs;
+    internal static long FrameLatencyWaitCount;
+    internal static int RawPresentFlagMode = 2;
+
+    // show_fps=1: per-window fps overlay counting ACTUAL presented frames
+    // (post gating) - not render ticks - so the number is what the user sees.
+    private Label _fpsLabel;
+    private long _fpsLabelFrames;
+    private double _fpsLabelT;
 
     private static Cursor _hiddenCursor;
 
@@ -239,21 +370,15 @@ void main()
             // path (res_mult < 1.0: shader renders into a smaller RT that is
             // upscaled to the screen by the blit pass). At res_mult == 1.0
             // with no diag the normal path renders straight to the backbuffer.
-            if (Program.DiagMode is not (0 or 7) || IsCanvasOwner)
+            if (!Program.CanvasPipeline || IsCanvasOwner)
             {
                 // Normal runs: the blit VB holds this window's canvas-slice
                 // quad (crop-to-fit UV window into the shared canvas).
                 // Diag modes: the fullscreen letterbox blit quad.
                 _blitVb = _device.CreateBuffer(BufferType.VertexBuffer,
-                    Program.DiagMode is 0 or 7 ? ComputeCanvasVerts() : ComputeBlitVerts());
+                    Program.CanvasPipeline ? ComputeCanvasVerts() : ComputeBlitVerts());
                 // DIAG 6: static control buffer (kept for repro runs).
-                _blitVbStatic = _device.CreateBuffer(BufferType.VertexBuffer, new VPosUv[4]
-                {
-                    new(new Vector2( 1f,  1f), new Vector2(1f, 0f)),
-                    new(new Vector2( 1f, -1f), new Vector2(1f, 1f)),
-                    new(new Vector2(-1f, -1f), new Vector2(0f, 1f)),
-                    new(new Vector2(-1f,  1f), new Vector2(0f, 0f)),
-                });
+                _blitVbStatic = _device.CreateBuffer(BufferType.VertexBuffer, FullscreenQuad);
 
                 // RT sizes: diag 5/6 need the master-size RT for their pixel
                 // readbacks; other diag modes use client x mult; a normal run
@@ -261,7 +386,7 @@ void main()
                 // x mult - the shader renders into it once per frame.
                 int rtW, rtH;
                 if (Program.DiagMode is 5 or 6) { rtW = _master.Width; rtH = _master.Height; }
-                else if (Program.DiagMode is 0 or 7)
+                else if (Program.CanvasPipeline)
                 {
                     rtW = Math.Max(1, (int) Math.Round(_master.Width * _resMult));
                     rtH = Math.Max(1, (int) Math.Round(_master.Height * _resMult));
@@ -277,14 +402,8 @@ void main()
                 _fb = _device.CreateFramebuffer(new FramebufferAttachment(_rt));
                 _sampler = _device.CreateSamplerState(SamplerStateDescription.LinearClamp);
                 _pointSampler = _device.CreateSamplerState(SamplerStateDescription.PointClamp);
-                _blitQuadStatic = _device.CreateBuffer(BufferType.VertexBuffer, new VPosUv[4]
-                {
-                    new(new Vector2( 1f,  1f), new Vector2(1f, 0f)), // top-right
-                    new(new Vector2( 1f, -1f), new Vector2(1f, 1f)), // bottom-right
-                    new(new Vector2(-1f, -1f), new Vector2(0f, 1f)), // bottom-left
-                    new(new Vector2(-1f,  1f), new Vector2(0f, 0f)), // top-left
-                });
-                Log.W($"InitGraphics: {(Program.DiagMode is 0 or 7 ? "canvas" : "scaled path")} RT {rtW}x{rtH} (master={_master.Width}x{_master.Height}, mult={_resMult:0.###}, blend={_scaleBlend:0.###})");
+                _blitQuadStatic = _device.CreateBuffer(BufferType.VertexBuffer, FullscreenQuad);
+                Log.W($"InitGraphics: {(Program.CanvasPipeline ? "canvas" : "scaled path")} RT {rtW}x{rtH} (master={_master.Width}x{_master.Height}, mult={_resMult:0.###}, blend={_scaleBlend:0.###})");
             }
 
             // Hide the cursor only after everything initialized (fullscreen).
@@ -292,13 +411,13 @@ void main()
 
             // Normal runs: this window hosts the shared device - set up the
             // canvas wrap + raw blit that ALL windows (itself included) use.
-            if (Program.DiagMode is 0 or 7 && IsCanvasOwner)
+            if (Program.CanvasPipeline && IsCanvasOwner)
                 CanvasBlit.EnsureShared(this);
 
             Log.W("InitGraphics: all GPU resources created OK");
 
-            // ---- DIAG 4/5/6/7: grab raw D3D11 objects for pixel readback.
-            if (Program.DiagMode is 4 or 5 or 6 or 7)
+            // ---- DIAG 1/4/5/6: grab raw D3D11 objects for pixel readback.
+            if (Program.DiagMode is 1 or 4 or 5 or 6)
             {
                 try
                 {
@@ -340,7 +459,8 @@ void main()
         {
             _rt?.Dispose(); _fb?.Dispose(); _sampler?.Dispose(); _pointSampler?.Dispose();
             _blitVb?.Dispose(); _blitVbStatic?.Dispose(); _blitQuadStatic?.Dispose();
-            _rawSwap?.Dispose(); _rawRtv?.Dispose(); _rawVb?.Dispose();
+            _rawSwap?.Dispose(); _rawVb?.Dispose();
+            _laneSwap?.Dispose(); _laneVb?.Dispose(); _laneWaitable = IntPtr.Zero;
             _quadVb?.Dispose(); _indexBuffer?.Dispose(); _uniform?.Dispose();
             _mainLayout?.Dispose(); _blitLayout?.Dispose();
             _mainShader?.Dispose(); _blitShader?.Dispose(); _depthDisabled?.Dispose();
@@ -353,11 +473,13 @@ void main()
     public void Render(float time)
     {
         if (_disposed) return;
-        if (Program.DiagMode is 0 or 7)
+        if (Program.CanvasPipeline)
         {
-            // Shared canvas path: raw windows have no Pie device of their own,
-            // so this branch runs BEFORE the _device guard below.
-            CanvasFrame(time);
+            // Shared canvas path: DRAW phase only - presents happen later,
+            // after every window has drawn, so no draw command ever sits
+            // behind a flip in the GPU queue (a flip cannot retire before a
+            // vblank; work queued behind it stalls the whole pipeline).
+            CanvasDraw(time);
             return;
         }
         if (_device == null) return;
@@ -428,13 +550,7 @@ void main()
 
                 // B: blit path with dynamic VB (UpdateBuffer-filled).
                 _device.ClearColorBuffer(0f, 1f, 0f, 1f);
-                VPosUv[] gv =
-                {
-                    new(new Vector2( 1f,  1f), new Vector2(1f, 0f)),
-                    new(new Vector2( 1f, -1f), new Vector2(1f, 1f)),
-                    new(new Vector2(-1f, -1f), new Vector2(0f, 1f)),
-                    new(new Vector2(-1f,  1f), new Vector2(0f, 0f)),
-                };
+                VPosUv[] gv = FullscreenQuad;
                 _device.UpdateBuffer(_blitVb, 0, gv);
                 _device.SetShader(_blitShader);
                 _device.SetDepthStencilState(_depthDisabled);
@@ -461,20 +577,14 @@ void main()
 
         // ---- DIAG 1/4: gradient straight to the backbuffer (proves the blit
         // geometry / rasterizer path without touching the RT or user shader).
-        // Diag 4 additionally reads pixels back and dumps the D3D info queue.
+        // Diag 4 additionally reads pixels back.
         if (Program.DiagMode is 1 or 4)
         {
             _device.SetFramebuffer(null);
             _device.Viewport = new Rectangle(0, 0, w, h);
             _device.ClearColorBuffer(0f, 0f, 0f, 1f);
 
-            VPosUv[] gv =
-            {
-                new(new Vector2( 1f,  1f), new Vector2(1f, 0f)), // top-right
-                new(new Vector2( 1f, -1f), new Vector2(1f, 1f)), // bottom-right
-                new(new Vector2(-1f, -1f), new Vector2(0f, 1f)), // bottom-left
-                new(new Vector2(-1f,  1f), new Vector2(0f, 0f)), // top-left
-            };
+            VPosUv[] gv = FullscreenQuad;
             _device.UpdateBuffer(_blitVb, 0, gv);
             _device.SetShader(_blitShader);
             _device.SetDepthStencilState(_depthDisabled);
@@ -566,339 +676,6 @@ void main()
                             // accepted there by design.
     }
 
-    // ---- Shared canvas path (normal runs, diag=0) -------------------------
-
-    // Raw window (windows 1..N in a normal run): no Pie device of its own -
-    // a plain DXGI swapchain on the owner's shared device, blitting its
-    // slice of the owner's canvas.
-    public bool InitRawGraphics(RenderWindow owner)
-    {
-        try
-        {
-            _isRawWindow = true;
-            CanvasBlit.EnsureShared(owner);
-            Log.W($"Raw window initialized: bounds={Bounds} (shared device, canvas slice blit)");
-            return true;
-        }
-        catch (Exception ex)
-        {
-            Log.Ex("InitRawGraphics", ex);
-            return false;
-        }
-    }
-
-    // One normal-run frame: the owner renders the shader into the shared
-    // canvas ONCE, then every window blits its crop-to-fit slice and
-    // presents. Canvas iResolution = canvas size (master x mult).
-    private void CanvasFrame(float time)
-    {
-        int w = ClientSize.Width, h = ClientSize.Height;
-        if (w <= 0 || h <= 0) return;
-
-        if (IsCanvasOwner && _device != null)
-        {
-            // Pass A: the shader renders ONCE per frame into the shared
-            // canvas (master size x resMult). iResolution = canvas size.
-            _device.SetFramebuffer(_fb);
-            _device.Viewport = new Rectangle(0, 0, _rtW, _rtH);
-            _device.UpdateBuffer(_uniform, 0, new Vector4(_rtW, _rtH, 1f, time));
-            _device.SetShader(_mainShader);
-            _device.SetUniformBuffer(0u, _uniform);
-            _device.SetDepthStencilState(_depthDisabled);
-            _device.SetPrimitiveType(PrimitiveType.TriangleList);
-            _device.SetInputLayout(_mainLayout);
-            _device.SetVertexBuffer(0u, _quadVb, 8u);
-            _device.SetIndexBuffer(_indexBuffer, IndexType.UInt);
-            _device.DrawIndexed(6u);
-
-            // Pass B: this window's slice blit - done through Pie itself
-            // (framebuffer null = Pie's own current backbuffer), so Pie keeps
-            // handling buffer rotation and resize. Never cache an RTV over
-            // the swapchain: the backbuffer is recreated on resize and the
-            // first version of this blit distorted exactly that way.
-            _device.SetFramebuffer(null);
-            _device.Viewport = new Rectangle(0, 0, w, h);
-            _device.SetShader(_blitShader);
-            _device.SetTexture(0u, _rt, _sampler);
-            _device.SetTexture(1u, _rt, _pointSampler);
-            _device.SetDepthStencilState(_depthDisabled);
-            _device.SetPrimitiveType(PrimitiveType.TriangleList);
-            _device.SetInputLayout(_blitLayout);
-            _device.SetVertexBuffer(0u, _blitVb, 16u);
-            _device.SetIndexBuffer(_indexBuffer, IndexType.UInt);
-            _device.DrawIndexed(6u);
-
-            Diag7Dump();
-            _device.Present(PresentInterval);
-            return;
-        }
-
-        EnsureRawTarget();
-        CanvasBlit.Draw(this);
-        Diag7Dump();
-        _rawSwap.Present(PresentInterval, 0);
-    }
-
-    // DIAG 7: once per window, read the actual backbuffer back and dump it
-    // as a base64 JPEG next to the log. Proves the real per-monitor output
-    // (crop-to-fit geometry) without screen capture, which Defender blocks.
-    private void Diag7Dump()
-    {
-        if (Program.DiagMode != 7) return;
-        _diagFrames++;
-        if (_diagDone || _diagFrames < 30) return;
-        _diagDone = true;
-        try
-        {
-            D3D.ID3D11Texture2D tex;
-            if (_isRawWindow)
-            {
-                tex = _rawSwap.GetBuffer<D3D.ID3D11Texture2D>(0);
-            }
-            else
-            {
-                // Owner: Pie's swapchain backbuffer, grabbed in InitGraphics.
-                if (_backTex == null) { Log.W("DIAG7: no backtex"); return; }
-                tex = _backTex;
-            }
-            DumpTextureJpeg(tex, $"{ClientSize.Width}x{ClientSize.Height}");
-            if (_isRawWindow) tex.Dispose();
-        }
-        catch (Exception ex) { Log.Ex("DIAG7 dump", ex); }
-    }
-
-    // Copies a D3D texture into a staging texture, converts it to a Bitmap,
-    // downscales to 50% and writes a base64 JPEG into the app data folder.
-    private unsafe void DumpTextureJpeg(D3D.ID3D11Texture2D tex, string tag)
-    {
-        var dev = CanvasBlit.Dev;
-        var ctx = CanvasBlit.Ctx;
-        var desc = tex.Description;
-        var sdesc = desc;
-        sdesc.Usage = D3D.ResourceUsage.Staging;
-        sdesc.BindFlags = D3D.BindFlags.None;
-        sdesc.CPUAccessFlags = D3D.CpuAccessFlags.Read;
-        sdesc.MiscFlags = D3D.ResourceOptionFlags.None;
-        using D3D.ID3D11Texture2D staging = dev.CreateTexture2D(sdesc);
-        ctx.CopyResource(staging, tex);
-
-        int w = desc.Width, h = desc.Height, bpp = 4;
-        var bmp = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-        D3D.MappedSubresource map = ctx.Map(staging, 0, D3D.MapMode.Read, D3D.MapFlags.None);
-        try
-        {
-            var bd = bmp.LockBits(new Rectangle(0, 0, w, h),
-                System.Drawing.Imaging.ImageLockMode.WriteOnly,
-                System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-            try
-            {
-                // B8G8R8A8 bytes map 1:1 onto GDI+ Format32bppArgb (little
-                // endian ARGB), except for the stride padding between rows.
-                for (int y = 0; y < h; y++)
-                    Marshal.Copy(new ReadOnlySpan<byte>((byte*) map.DataPointer + y * (long) map.RowPitch, w * bpp).ToArray(),
-                        0, IntPtr.Add(bd.Scan0, y * bd.Stride), w * bpp);
-            }
-            finally { bmp.UnlockBits(bd); }
-        }
-        finally { ctx.Unmap(staging, 0); }
-
-        int dw = Math.Max(1, w / 2), dh = Math.Max(1, h / 2);
-        using var small = new Bitmap(dw, dh);
-        using (var g = Graphics.FromImage(small))
-        {
-            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-            g.DrawImage(bmp, 0, 0, dw, dh);
-        }
-        using var ms = new MemoryStream();
-        var enc = System.Drawing.Imaging.ImageCodecInfo.GetImageEncoders()
-            .First(c => c.MimeType == "image/jpeg");
-        var ep = new System.Drawing.Imaging.EncoderParameters(1);
-        ep.Param[0] = new System.Drawing.Imaging.EncoderParameter(
-            System.Drawing.Imaging.Encoder.Quality, 60L);
-        small.Save(ms, enc, ep);
-        string b64 = Convert.ToBase64String(ms.ToArray());
-        string path = Path.Combine(Settings.AppDataDir, $"diag7_{tag}.b64");
-        File.WriteAllText(path, b64);
-        bmp.Dispose();
-        Log.W($"DIAG7 dump {tag}: {w}x{h} -> {dw}x{dh} jpeg ({b64.Length} b64 chars) -> {path}");
-    }
-
-    // Raw-window swapchain + slice VB management (lazy, after the window
-    // settles). The owner has no raw target at all - it blits through Pie.
-    private void EnsureRawTarget()
-    {
-        if (!_isRawWindow) return;
-
-        int w = ClientSize.Width, h = ClientSize.Height;
-        if (_rawVb != null && _rawBuiltW == w && _rawBuiltH == h) return;
-
-        if (_rawSwap == null)
-        {
-            _rawSwap = CanvasBlit.CreateSwapchain(Handle, w, h);
-            _rawRtv = CanvasBlit.CreateBackbufferRtv(_rawSwap);
-            Log.W($"Raw swapchain created: {w}x{h}");
-        }
-        else if (_rawBuiltW != w || _rawBuiltH != h)
-        {
-            _rawRtv?.Dispose();
-            _rawSwap.ResizeBuffers(1, w, h, DXGI.Format.B8G8R8A8_UNorm, DXGI.SwapChainFlags.None);
-            _rawRtv = CanvasBlit.CreateBackbufferRtv(_rawSwap);
-            Log.W($"Raw swapchain resized: {w}x{h}");
-        }
-
-        _rawVb?.Dispose();
-        _rawVb = CanvasBlit.CreateVb(ComputeCanvasVerts());
-        _rawBuiltW = w;
-        _rawBuiltH = h;
-    }
-
-    // Maps this screen's share of the shared canvas: the canvas (master size)
-    // is scaled uniformly to COVER the group bbox (centered, overflow
-    // cropped) and the screen samples the canvas window it shows. Returns a
-    // static quad whose vertices place the visible intersection on screen
-    // (TR, BR, BL, TL - CW winding, no vertical flip).
-    private VPosUv[] ComputeCanvasVerts()
-    {
-        float w = ClientSize.Width, h = ClientSize.Height;
-        float mx = _offsetInGroup.X, my = _offsetInGroup.Y;
-        float gw = _groupBbox.Width, gh = _groupBbox.Height;
-
-        float scale = Math.Max(gw / _master.Width, gh / _master.Height); // cover
-        float dw = _master.Width * scale, dh = _master.Height * scale;
-        float ox = (gw - dw) / 2f, oy = (gh - dh) / 2f;
-
-        float ix0 = Math.Max(ox, mx), iy0 = Math.Max(oy, my);
-        float ix1 = Math.Min(ox + dw, mx + w), iy1 = Math.Min(oy + dh, my + h);
-        if (!(ix0 < ix1 && iy0 < iy1))
-        {
-            _sliceEmpty = true;
-            return new VPosUv[4]
-            {
-                new(new Vector2(), new Vector2()), new(new Vector2(), new Vector2()),
-                new(new Vector2(), new Vector2()), new(new Vector2(), new Vector2()),
-            };
-        }
-        _sliceEmpty = false;
-
-        float u0 = (ix0 - ox) / dw, v0 = (iy0 - oy) / dh;
-        float u1 = (ix1 - ox) / dw, v1 = (iy1 - oy) / dh;
-
-        float px = ix0 - mx, py = iy0 - my;
-        float pw = ix1 - ix0, ph = iy1 - iy0;
-        float cx0 = px / w * 2f - 1f, cx1 = (px + pw) / w * 2f - 1f;
-        float cy0 = 1f - py / h * 2f, cy1 = 1f - (py + ph) / h * 2f;
-
-        return new VPosUv[4]
-        {
-            new(new Vector2(cx1, cy0), new Vector2(u1, v0)), // top-right
-            new(new Vector2(cx1, cy1), new Vector2(u1, v1)), // bottom-right
-            new(new Vector2(cx0, cy1), new Vector2(u0, v1)), // bottom-left
-            new(new Vector2(cx0, cy0), new Vector2(u0, v0)), // top-left
-        };
-    }
-
-
-    // Builds the blit quad vertices for the current client size and letterbox
-    // layout. Winding MUST be clockwise (D3D11 default rasterizer treats CW as
-    // front and culls the rest). Vertex order mirrors the proven fullscreen
-    // quad in ShaderRunner: TR, BR, BL, TL. Top of the quad samples v0 (top
-    // row of the RT) - no vertical flip. Clip space has +Y up (D3D11).
-    private VPosUv[] ComputeBlitVerts()
-    {
-        float w = ClientSize.Width, h = ClientSize.Height;
-        float mx = _offsetInGroup.X, my = _offsetInGroup.Y;
-
-        float ix0 = Math.Max(_letterbox.X, mx);
-        float iy0 = Math.Max(_letterbox.Y, my);
-        float ix1 = Math.Min(_letterbox.X + _fitted.Width, mx + w);
-        float iy1 = Math.Min(_letterbox.Y + _fitted.Height, my + h);
-
-        if (!(ix0 < ix1 && iy0 < iy1))
-            ix0 = iy0 = ix1 = iy1 = 0; // no visible slice; Pass B skips the draw
-
-        float px = ix0 - mx, py = iy0 - my;
-        float pw = ix1 - ix0, ph = iy1 - iy0;
-
-        float u0 = (ix0 - _letterbox.X) / _fitted.Width, v0 = (iy0 - _letterbox.Y) / _fitted.Height;
-        float u1 = (ix1 - _letterbox.X) / _fitted.Width, v1 = (iy1 - _letterbox.Y) / _fitted.Height;
-
-        float cx0 = px / w * 2f - 1f, cx1 = (px + pw) / w * 2f - 1f;
-        float cy0 = 1f - py / h * 2f, cy1 = 1f - (py + ph) / h * 2f;
-
-        return new VPosUv[4]
-        {
-            new(new Vector2(cx1, cy0), new Vector2(u1, v0)), // top-right
-            new(new Vector2(cx1, cy1), new Vector2(u1, v1)), // bottom-right
-            new(new Vector2(cx0, cy1), new Vector2(u0, v1)), // bottom-left
-            new(new Vector2(cx0, cy0), new Vector2(u0, v0)), // top-left
-        };
-    }
-
-    // ---- DIAG 4 helpers ------------------------------------------------------
-
-    private unsafe void DumpBackbufferPixels()
-    {
-        try
-        {
-            var ctx = (D3D.ID3D11DeviceContext) _device.GetType().GetField("_context",
-                BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(_device);
-
-            ctx.CopyResource(_stagingTex, _backTex);
-
-            D3D.MappedSubresource map = ctx.Map(_stagingTex, 0, D3D.MapMode.Read, D3D.MapFlags.None);
-            {
-                int w = _backTex.Description.Width;
-                int h = _backTex.Description.Height;
-                int rowPitch = (int) map.RowPitch;
-                Log.W($"DIAG4 READBACK {w}x{h} rowPitch={rowPitch}:");
-                foreach ((int fx, string nm) in new[] { (w / 10, "left"), (w / 2, "mid"), (w * 9 / 10, "right") })
-                {
-                    byte* p = (byte*) map.DataPointer + (h / 2) * rowPitch + fx * 4;
-                    Log.W($"DIAG4 pixel {nm} ({fx},{h / 2}) = R{p[0]} G{p[1]} B{p[2]} A{p[3]}");
-                }
-                byte* tl = (byte*) map.DataPointer + 5 * rowPitch + 5 * 4;
-                byte* br = (byte*) map.DataPointer + (h - 6) * rowPitch + (w - 6) * 4;
-                Log.W($"DIAG4 pixel topleft = R{tl[0]} G{tl[1]} B{tl[2]} A{tl[3]}");
-                Log.W($"DIAG4 pixel botright = R{br[0]} G{br[1]} B{br[2]} A{br[3]}");
-            }
-            ctx.Unmap(_stagingTex, 0);
-        }
-        catch (Exception ex) { Log.Ex("DIAG4 readback", ex); }
-    }
-
-    // Generic readback: copies any D3D texture to a fresh staging texture and
-    // logs sample pixels.
-    private unsafe void DumpD3DTex(D3D.ID3D11Texture2D tex, string label)
-    {
-        try
-        {
-            var ctx = (D3D.ID3D11DeviceContext) _device.GetType().GetField("_context",
-                BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(_device);
-            var dev = (D3D.ID3D11Device) _d3dDevice;
-
-            var sdesc = tex.Description;
-            sdesc.Usage = D3D.ResourceUsage.Staging;
-            sdesc.BindFlags = D3D.BindFlags.None;
-            sdesc.CPUAccessFlags = D3D.CpuAccessFlags.Read;
-            sdesc.MiscFlags = D3D.ResourceOptionFlags.None;
-            using D3D.ID3D11Texture2D staging = dev.CreateTexture2D(sdesc);
-            ctx.CopyResource(staging, tex);
-
-            D3D.MappedSubresource map = ctx.Map(staging, 0, D3D.MapMode.Read, D3D.MapFlags.None);
-            {
-                int w = sdesc.Width, h = sdesc.Height, rowPitch = (int) map.RowPitch;
-                Log.W($"DIAG5 READBACK {label} {w}x{h} rowPitch={rowPitch}:");
-                foreach ((int fx, string nm) in new[] { (w / 10, "left"), (w / 2, "mid"), (w * 9 / 10, "right") })
-                {
-                    byte* p = (byte*) map.DataPointer + (h / 2) * rowPitch + fx * 4;
-                    Log.W($"DIAG5 {label} pixel {nm} ({fx},{h / 2}) = R{p[0]} G{p[1]} B{p[2]} A{p[3]}");
-                }
-            }
-            ctx.Unmap(staging, 0);
-        }
-        catch (Exception ex) { Log.Ex($"DIAG5 readback {label}", ex); }
-    }
-
     private void RequestShutdown()
     {
         if (AllowInputExit) ShutdownRequested = true;
@@ -956,13 +733,13 @@ void main()
             {
                 _blitVb.Dispose();
                 _blitVb = _device.CreateBuffer(BufferType.VertexBuffer,
-                    Program.DiagMode is 0 or 7 ? ComputeCanvasVerts() : ComputeBlitVerts());
+                    Program.CanvasPipeline ? ComputeCanvasVerts() : ComputeBlitVerts());
                 Log.W($"OnResize: blit VB rebuilt for {ClientSize.Width}x{ClientSize.Height}");
             }
             // Scaled path only (per-window RTs, diag 3 style): rebuild the RT
             // at client size x multiplier. The shared canvas RT is master
             // sized and must NOT follow window resizes.
-            if (_device != null && _rt != null && _resMult < 1f && Program.DiagMode is not (0 or 7))
+            if (_device != null && _rt != null && _resMult < 1f && !Program.CanvasPipeline)
             {
                 int rtW = Math.Max(1, (int) Math.Round(ClientSize.Width * _resMult));
                 int rtH = Math.Max(1, (int) Math.Round(ClientSize.Height * _resMult));

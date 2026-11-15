@@ -1,5 +1,9 @@
 # WinGLSLScrSaver
 
+> **Agents: read `AGENT_HANDOFF.md` (repo root) first** - it documents the
+> FPS/pacing investigation, the present-serialization root cause, the AMD
+> keyed-mutex limitation, past crashes and the test workflow.
+
 A multi-monitor GLSL screensaver for Windows. Renders shaders with D3D11, written in C# / WinForms.
 
 Modes: `/s` (run), `/c` (config), `/p` (preview), plus `--diag` modes for troubleshooting.
@@ -16,9 +20,18 @@ Modes: `/s` (run), `/c` (config), `/p` (preview), plus `--diag` modes for troubl
 
 One process, one shared canvas. `/s` first computes groups from the connected screens: screens that tile a rectangle nearly perfectly (within 1% of the smaller screen's size, absorbing driver coordinate rounding and bezel compensation) merge into one group and are treated as a single monitor. One borderless top-most `RenderWindow` is created per group.
 
-The first window hosts the one Pie D3D11 device for the whole process and owns the shared canvas: a render target sized to the master resolution (max width and max height over all groups) times `res_mult`. Every other window is a raw window: a plain DXGI swapchain created directly on that same device. Separate devices cannot share textures, which is why everything runs on one.
+The first window hosts the one Pie D3D11 device for the whole process and owns the shared canvas: a render target sized to the master resolution (max width and max height over all groups) times `res_mult`. Every other window is a raw window: a plain flip-model DXGI swapchain (2+ buffers, `AllowTearing`) created directly on that same device. Separate devices cannot share textures, which is why everything runs on one.
 
-`Program.cs` runs the loop: each frame the owner renders the shader into the canvas once, then every window blits its slice and presents. With `fps_cap = 0` the loop relies on vsync (`Present(1)`). With a cap set, the loop paces itself with a high resolution waitable timer (immune to the 15.6 ms sleep degradation of unfocused processes) and all presents use interval 0, since per-monitor presents are decoupled from the render rate.
+## Per-monitor present pacing
+
+The loop never blocks on any monitor's vblank. Each frame is split into a draw phase and a present phase:
+
+1. **Draw phase**: the owner renders the shader into the shared canvas once, then every window whose monitor is *due* blits its slice. No present happens yet - a flip cannot retire before a vblank, and any GPU work queued behind a flip would stall for up to a whole vblank (measured at ~5.9 ms per frame).
+2. **Present phase**: every window that drew now queues its flip with `Present(0, DO_NOT_WAIT | ALLOW_TEARING)` - never blocking the loop.
+
+Each window paces itself to its own monitor's refresh rate (`EnumDisplaySettings`): a monitor that is not due yet simply keeps showing its previous frame, exactly like a native per-monitor vsync loop - so a 60 Hz portrait can never throttle a 170 Hz landscape and vice versa. The loop itself is paced by the high resolution waitable timer (immune to the 15.6 ms sleep degradation of unfocused processes) at the fastest monitor's refresh, or at `fps_cap` when set.
+
+Known limit: presents from one D3D11 device serialize at vblank granularity - the second (and further) `Present` of a frame costs about one primary-vblank period, so with several monitors the loop runs below the fastest refresh even though no single monitor is the bottleneck. Removing that limit needs per-monitor present threads (draws stay on the main thread; only the flip queueing moves).
 
 ## Shader handling
 
@@ -26,12 +39,11 @@ The first window hosts the one Pie D3D11 device for the whole process and owns t
 
 ## Render pipeline (normal runs)
 
-Per frame:
+1. **Pass A, once per loop tick**: the shader renders into the shared canvas. The shader sees the canvas resolution (master x `res_mult`) as `iResolution`.
+2. **Pass B, per due window**: a crop-to-fit blit of that window's slice. The canvas is scaled uniformly to cover the group's area (centered, overflow cropped, never stretched or letterboxed) and the window samples the part of the canvas it shows. The owner blits through Pie itself (framebuffer null, so Pie handles backbuffer rotation and resize); raw windows use the raw HLSL blit in `CanvasBlit.cs`, which samples the canvas twice (bilinear + nearest) and mixes the two samples by `scale_blend`. That factor is baked into the blit shader source at startup as a GLSL float literal (which must always carry a decimal point). Raw flip-model backbuffers have no stable RTV: `GetBuffer(0)` always returns the *current* back buffer in D3D11, so the RTV is re-created per frame.
+3. **Present phase, per due window**: `Present(0, DO_NOT_WAIT | ALLOW_TEARING)` - non-blocking, per-monitor cadence.
 
-1. **Pass A, once**: the shader renders into the shared canvas. The shader sees the canvas resolution (master x `res_mult`) as `iResolution`.
-2. **Pass B, per window**: a crop-to-fit blit of that window's slice. The canvas is scaled uniformly to cover the group's area (centered, overflow cropped, never stretched or letterboxed) and the window samples the part of the canvas it shows. The owner blits through Pie itself (framebuffer null, so Pie handles backbuffer rotation and resize); raw windows use the raw HLSL blit in `CanvasBlit.cs`, which samples the canvas twice (bilinear + nearest) and mixes the two samples by `scale_blend`. That factor is baked into the blit shader source at startup as a GLSL float literal (which must always carry a decimal point).
-
-So the shader runs once per frame no matter how many monitors there are, and `res_mult` is paid once instead of once per monitor. Diag modes 1 to 6 bypass this pipeline and use their own per-window paths; diag 7 runs it and additionally dumps each window's real backbuffer as a base64 JPEG into the app data folder, so output can be checked without screen capture.
+So the shader runs once per loop tick no matter how many monitors there are, and `res_mult` is paid once instead of once per monitor. Diag modes 1 to 6 bypass this pipeline and use their own per-window paths; diag 7 runs the same pipeline and only turns verbose logging on.
 
 One Pie quirk worth knowing: in 0.10.1, `UpdateBuffer` on a dynamic vertex buffer silently fails, so all vertex buffers here are created static.
 
@@ -48,30 +60,35 @@ On every start one shader is picked at random:
 All settings are stored in `%localappdata%\WinGLSLScrSaver\config.txt` as `key=value` lines. A config file that only holds a folder path (the old format) still works.
 
 - `folder`: where shaders are picked from
-- `fps_cap`: `0` = auto (vsync). When set, the loop runs at that rate (clamped to 1..max screen refresh, 120)
+- `fps_cap`: `0` = auto (pace at the fastest monitor's refresh). When set, the loop runs at that rate (clamped to 1..max screen refresh, 120)
 - `res_mult`: 0.05 to 1.0. Scales the shared canvas; the crop-to-fit blits stay at full screen resolution
 - `scale_blend`: 0 = nearest, 1 = bilinear, values in between mix both
+- `show_fps`: `1` shows a small counter on each monitor. It counts frames actually handed to the display (post pacing) - not render ticks
 
 ## Logs
 
 Only DEBUG builds and `--diag` runs write anything; Release is fully silent.
 
 - `%localappdata%\WinGLSLScrSaver\winglslscrsaver.log`
-- `%localappdata%\WinGLSLScrSaver\ss_fragment_dump.fs`
-- `%localappdata%\WinGLSLScrSaver\diag7_*.b64` (only in `--diag=7` runs)
+
+In fullscreen canvas runs (`--diag=0`/`--diag=7`) the log also contains an `FPS:` line every ~2 s: the loop rate, per-window present rates, and where the frame budget went (pre/render/wait/present timings with min/max) - that is how the present-serialization limit above was measured.
 
 ## Source (`src\`)
 
 | File | What it does |
 |---|---|
-| `Program.cs` | entry point, modes, render loop |
+| `Program.cs` | entry point, modes, window creation, shader pick |
+| `Program.RunLoop.cs` | partial: render loop, pacing engine (grid/rel/pi), FPS stats |
 | `Core\Log.cs` | debug logging |
-| `Core\Settings.cs` | config file |
-| `Gl\Native.cs` | Win32 interop |
+| `Core\Settings.cs` | config file (every key documented in the header comment) |
+| `Gl\Native.cs` | Win32 interop incl. the high-res waitable timer |
 | `Gl\ScreenGroup.cs` | monitor grouping with the 1% merge tolerance |
 | `Gl\ShaderAdapter.cs` | GLSL adaptation, embedded default shader |
-| `Rendering\RenderWindow.cs` | canvas owner rendering, slice blits, diag paths |
-| `Rendering\CanvasBlit.cs` | raw D3D11 helpers: extra swapchains, backbuffer RTVs, the HLSL slice blit |
+| `Rendering\RenderWindow.cs` | partial: fields, lifecycle, InitGraphics, Render() dispatch |
+| `Rendering\RenderWindow.Canvas.cs` | partial: shared-canvas draw/present path, pacing gating, fps overlay |
+| `Rendering\RenderWindow.Diag.cs` | partial: diag 4/5/6 readback helpers |
+| `Rendering\CanvasBlit.cs` | partial: single-device blit pipeline, swapchains, QI helpers |
+| `Rendering\CanvasBlit.Lane.cs` | partial: present-lane machinery (present_lanes=2) with probe + fail-safe fallback |
 | `UI\ConfigDialog.cs` | the `/c` dialog |
 
 ## Build and install
