@@ -228,21 +228,16 @@ internal partial class RenderWindow
                 var child = new Control
                 {
                     Location = new Point(0, 0),
-                    Size = new Size(64, 24),
-                    Enabled = false, // never takes mouse input - input-exit keeps working
+                    Size = new Size(1, 1),
+                    BackColor = Color.FromArgb(16, 16, 16),
+                    Enabled = false
                 };
                 Controls.Add(child);
                 child.BringToFront();
-                // Layered + hit-test transparent + alpha 0 = fully invisible,
-                // while remaining a child HWND that clips the swapchain
-                // (layered child windows need Win8+).
+
                 IntPtr h = child.Handle;
-                int ex = (int) Native.GetWindowLong(h, Native.GWL_EXSTYLE);
-                Native.SetWindowLong(h, Native.GWL_EXSTYLE,
-                    (IntPtr) (ex | Native.WS_EX_LAYERED | Native.WS_EX_TRANSPARENT));
-                Native.SetLayeredWindowAttributes(h, 0, 0, Native.LWA_ALPHA);
                 _tearFixChild = child;
-                Log.W($"Tear-fix: transparent child window created over the flip swapchain " +
+                Log.W($"Tear-fix: child window created over the flip swapchain " +
                       $"(show_fps off, hwnd=0x{h.ToInt64():X})");
             }
             catch (Exception ex) { Log.Ex("Tear-fix child window", ex); }
