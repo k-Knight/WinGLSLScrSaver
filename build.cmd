@@ -3,9 +3,7 @@ setlocal
 cd /d "%~dp0"
 echo === WinGLSLScrSaver build ===
 
-rem Everything the build produces lives in publish\: the .scr, the default
-rem shader and (when output is redirected) build_log.txt - the repo root
-rem stays clean (publish/ is gitignored).
+rem Everything the build produces lives in publish\ (gitignored).
 
 if not exist publish mkdir publish
 
@@ -17,12 +15,8 @@ if errorlevel 1 (
   exit /b 1
 )
 
-rem Fully self-contained single-file publish:
-rem   --self-contained true                  bundles the .NET runtime itself
-rem   -p:PublishSingleFile=true              one exe, no DLL sprawl
-rem   -p:IncludeNativeLibrariesForSelfExtract=true  native libs inside the exe
-rem   -p:EnableCompressionInSingleFile=true  compressed (~smaller file)
-rem   -p:PublishTrimmed=false                WinForms does not support trimming
+rem Fully self-contained single-file publish (no DLL sprawl; WinForms does
+rem not support trimming).
 dotnet publish WinGLSLScrSaver.csproj -c Release -r win-x64 --self-contained true ^
   -p:PublishSingleFile=true ^
   -p:IncludeNativeLibrariesForSelfExtract=true ^

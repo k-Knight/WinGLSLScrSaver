@@ -36,10 +36,9 @@ internal class ScreenGroup
         return groups;
     }
 
-    // Monitors that tile a rectangle nearly perfectly are merged into one
-    // group and treated as one monitor - the shared canvas then spans them
-    // seamlessly. A 1% tolerance (of the smaller screen's size) absorbs
-    // coordinate rounding from drivers, DPI scaling and bezel compensation.
+    // Monitors that tile a rectangle nearly perfectly (1% tolerance absorbs
+    // coordinate rounding from drivers/DPI/bezel compensation) are merged
+    // into one group - the shared canvas then spans them seamlessly.
     private static bool FlushAdjacent(Rectangle a, Rectangle b)
     {
         double tolX = Math.Min(a.Width, b.Width) * 0.01;
@@ -56,4 +55,3 @@ internal class ScreenGroup
         return stacked;
     }
 }
-

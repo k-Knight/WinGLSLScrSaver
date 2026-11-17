@@ -4,8 +4,7 @@ using System.Globalization;
 
 internal static class Settings
 {
-    // %localappdata%\WinGLSLScrSaver holds the config file, the log and
-    // the default shader location - no machine-specific path is ever baked in.
+    // %localappdata%\WinGLSLScrSaver holds the config file, log and default shaders.
     public static string AppDataDir => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "WinGLSLScrSaver");
@@ -14,72 +13,25 @@ internal static class Settings
 }
 
 // Persisted settings. config.txt is key=value lines:
-//   folder=...      shader folder (empty = not configured)
-//   fps_cap=0       render loop FPS cap; 0 = auto (present with vsync, today's behavior)
-//   res_mult=1.0    resolution multiplier 0.05..1.0 (below 1.0 renders into a
-//                   smaller target that is upscaled on display)
-//   scale_blend=0.5 upscale interpolation: 0 = nearest neighbour, 1 = bilinear,
-//                   between = per-pixel weighted mix
-//   show_fps=0     per-window fps overlay; counts frames actually handed to
-//                  the display (post gating), not render ticks
-//   raw_present_flags=3  present flags for raw/lane windows (gated runs):
-//                  0 = none, 1 = ALLOW_TEARING, 2 = DO_NOT_WAIT|ALLOW_TEARING
-//                  3 = DO_NOT_WAIT only (default). Modes 1/2 add ALLOW_TEARING:
-//                  fps-investigation only - with SyncInterval 0 they present
-//                  straight to scanout and visibly tear on non-primary
-//                  monitors. The show_fps label hides the tearing (a child
-//                  window over the flip swapchain forces DWM-composed,
-//                  vblank-synced presentation).
-//   tear_fix_child=0  transparent child-window tearing fix: 1 = when show_fps
-//                  is OFF, create an invisible (layered, alpha=0) child window
-//                  over the flip swapchain - the same DWM-composition hack the
-//                  fps label provides (a child window over the flip swapchain
-//                  forces DWM-composed, vblank-synced presentation) without
-//                  showing anything. No effect while show_fps is on (the fps
-//                  label already does the job).
-//   fps_pace=rel    how the FPS cap paces the loop (only when fps_cap>0 or
-//                  fullscreen canvas runs):
-//                  grid = absolute 120Hz-style grid, ceil-quantized (old
-//                         behavior; beats with composition sync when per-
-//                         frame work sits just under one cap slot -> the
-//                         measured 80 fps instead of 120)
-//                  rel  = relative pacer: next due = previous due + 1/cap,
-//                         overrun-safe (reset when far behind). No grid
-//                         aliasing -> the cap is actually reached.
-//                  pi   = rel + a small proportional-integral trim of the
-//                         wait from the measured frame-interval error
-//                  (default rel: deterministic, strictly better than grid)
-//   present_threads=0  1 = each non-owner window presents from its own
-//                  thread, so the ~5.9ms DWM composition-period sync inside
-//                  Present(0) runs in parallel instead of eating the render
-//                  loop's frame budget. Owner stays on the main thread (Pie
-//                  device context is not thread-safe).
-//   raw_swap_blt=0  raw-window swapchain model experiment for the Present
-//                  stall investigation:
-//                  0 = flip model (default; on this driver each Present(0)
-//                      syncs one DWM composition period ~5.9ms)
-//                  1 = bitblt model, 2 buffers (Present becomes a copy into
-//                      DWM's surface, expected to return without the
-//                      compose-period sync; 1 buffer was measured at ~6ms
-//                      stall - that was the single-buffer release sync)
-//                  2 = bitblt model, 1 buffer (the old measured variant)
-//                  Blt mode disables the waitable object and tearing flags
-//                  (not supported by the blt model) and presents with
-//                  flags=0; windowed blt cannot tear (DWM composes from its
-//                  own copy), so no vsync is faked or needed.
-//   swap_buffers=4  raw swapchain buffer count 2..8 (deep queue = presents
-//                  return immediately; scanout drains at each monitor's own
-//                  refresh). "Fake vsync at the cost of extra buffers".
-//   max_latency=3   DXGI MaximumFrameLatency 1..(swap_buffers-1); lower =
-//                  less queued latency, higher = more present slack.
-//   present_lanes=1 1 = all swapchains on the owner device (one present
-//                  lane; Present calls serialize at DWM composition
-//                  granularity, capping multi-window setups at ~83 fps here).
-//                  2 = each non-owner window gets its own D3D11 device as a
-//                  second, fully parallel present lane; the shared canvas
-//                  crosses devices via a keyed-mutex shared texture. This is
-//                  the "extra buffer/lane per window" fix - no tearing (DWM
-//                  still composes) and no fps reduction.
+//   folder=...          shader folder (empty = not configured)
+//   fps_cap=120         render loop FPS cap; 0 = auto (fastest display's refresh)
+//   res_mult=1.0        render resolution multiplier 0.05..1.0 (<1 = render small, upscale)
+//   scale_blend=0.5     upscale interpolation 0 = nearest, 1 = bilinear
+//   show_fps=1          per-window fps overlay (counts frames actually displayed)
+//   tear_fix_child=0    invisible child window tearing fix (only when show_fps off);
+//                       same DWM-composition hack as the fps label, but nothing visible
+//   raw_present_flags=3 present flags for raw windows (gated runs): 0 = none,
+//                       1 = ALLOW_TEARING, 2 = DO_NOT_WAIT|ALLOW_TEARING, 3 = DO_NOT_WAIT (default).
+//                       1/2 tear visibly; a child window over the flip swapchain masks it
+//   fps_pace=rel        grid = absolute ceil-quantized grid (old, aliases with DWM);
+//                       rel = relative pacer, overrun-safe (default); pi = rel + PI trim
+//   present_threads=0   1 = each non-owner window presents from its own thread
+//   raw_swap_blt=0      0 = flip model (default), 1 = blt 2 buffers, 2 = blt 1 buffer;
+//                       blt disables waitable/tearing flags and presents with flags=0
+//   swap_buffers=4      raw swapchain buffers 2..8 (deep queue = presents return instantly)
+//   max_latency=3       DXGI MaximumFrameLatency 1..(swap_buffers-1)
+//   present_lanes=2     1 = one device lane (presents serialize, ~83 fps multi-mon cap);
+//                       2 = per-window device via keyed-mutex shared canvas (default)
 // A legacy config.txt that is a bare folder path (no '=') is still honoured.
 internal sealed class AppSettings
 {
@@ -87,12 +39,12 @@ internal sealed class AppSettings
     public const float MaxResMult = 1.0f;
 
     public string ShaderFolder = "";
-    public int FpsCap = 120;        // default 120; 0 = auto (vsync at fastest refresh)
+    public int FpsCap = 120;        // 0 = auto (vsync at fastest refresh)
     public float ResMult = 0.5f;
     public float ScaleBlend = 0.5f;
     public bool ShowFps = true;     // per-window fps overlay
-    public bool TearFixChild;       // invisible child window tearing fix (only used when ShowFps is off)
-    public int RawPresentFlags = 3; // see header comment (3 = DO_NOT_WAIT only - ALLOW_TEARING was the fps-test flag; it visibly tears)
+    public bool TearFixChild;       // invisible child window tearing fix (only when ShowFps is off)
+    public int RawPresentFlags = 3; // see header comment (3 = DO_NOT_WAIT only)
     public string FpsPace = "rel";  // grid | rel | pi
     public bool PresentThreads;     // per-window present threads (raw windows)
     public int SwapBuffers = 4;     // raw swapchain buffer count 2..8

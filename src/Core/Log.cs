@@ -6,9 +6,8 @@ internal static class Log
     private static readonly object _lock = new();
     private static string _path;
 
-    // Logging is a debug aid: enabled in DEBUG builds or when a --diag mode
-    // was requested explicitly. Release runs stay silent - no log file and
-    // no per-call file I/O (startup slowdown report).
+    // Logging is a debug aid: enabled in DEBUG builds or with an explicit
+    // --diag flag. Release runs stay silent (no per-call file I/O).
     internal static bool Verbose =
 #if DEBUG
         true;
@@ -21,9 +20,9 @@ internal static class Log
         get
         {
             if (_path != null) return _path;
-            // Logs live in %localappdata%\WinGLSLScrSaver\ next to the config
-            // file - never next to the exe (a screensaver's working directory
-            // is wherever Windows launched it from, e.g. System32).
+            // Logs live in %localappdata%\WinGLSLScrSaver\ - never next to
+            // the exe (a screensaver's working dir is wherever Windows
+            // launched it from, e.g. System32).
             try
             {
                 Directory.CreateDirectory(Settings.AppDataDir);

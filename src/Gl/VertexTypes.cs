@@ -2,9 +2,8 @@ namespace WinGLSLScrSaver;
 
 using System.Numerics;
 
-// Shared fullscreen-quad vertex format: clip position (xy) + uv (zw) packed
-// in one Vector4 - 16 bytes, matching both the Pie input layout
-// (R32G32B32A32_Float) and the raw D3D11 blit layout (float2 pos + float2 uv).
+// Fullscreen-quad vertex: clip position (xy) + uv (zw) in one 16-byte
+// Vector4, matching both the Pie input layout and the raw D3D11 blit layout.
 internal struct VPosUv
 {
     public Vector4 Data;

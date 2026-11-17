@@ -7,27 +7,18 @@ using D3D = Vortice.Direct3D11;
 using Vortice.D3DCompiler;
 using Vortice.DXGI;
 
-// Raw D3D11 machinery for the shared-canvas architecture (normal runs only).
-// Window 0 hosts the Pie device and renders the shader once per frame into
-// the canvas RT; EVERY window (window 0 included) then blits its crop-to-fit
-// slice of that canvas with plain D3D11 calls on the SAME device, so the
-// shader runs one time per frame no matter how many monitors there are.
-// Pie 0.10.1 cannot create a second swapchain on a device, so windows 1..N
-// get plain DXGI swapchains, and window 0 draws into the backbuffer texture
-// of the Pie swapchain it already has. The primitive topology is left alone:
-// the owner's Pie pass A sets TriangleList every frame before these draws.
+// Raw D3D11 machinery for the shared-canvas architecture: window 0 renders
+// the shader once per frame into the canvas RT; every window blits its
+// crop-to-fit slice on the SAME device. Pie 0.10.1 cannot create a second
+// swapchain on a device, so windows 1..N get plain DXGI swapchains.
 internal partial class CanvasBlit
 {
     // Vortice.DXGI does not map IDXGIKeyedMutex - declare it manually.
-    // FIXED 2026-11-16: old GUID was a different dxgi interface, NOT IDXGIResource. Correct IID from Windows 10 SDK dxgi.h: MIDL_INTERFACE("9d8e1289-d7b3-465f-8126-250e349af85d").
-    // Vtable: IDXGIObject (SetPrivateData, SetPrivateDataInterface,
-    // GetPrivateData, GetParent) + IDXGIDeviceSubObject (GetDevice) +
-    // AcquireSync + ReleaseSync. Return int = HRESULT (0 = S_OK).
     // Raw keyed-mutex access WITHOUT an RCW: GetObjectForIUnknown + cast does
     // a context QI that fails cross-thread (E_NOINTERFACE on the present
     // thread), so hold the raw interface pointer and call its vtable directly.
-    // Vtable slots: IUnknown(0..2) + IDXGIObject(3..6) + GetDevice(7) +
-    // AcquireSync(8) + ReleaseSync(9).
+    // Slots: IUnknown(0..2) + IDXGIObject(3..6) + GetDevice(7) + AcquireSync(8)
+    // + ReleaseSync(9). IID from Win10 SDK dxgi.h.
     internal sealed class KeyedMutexRaw
     {
         private readonly IntPtr _p;
@@ -61,11 +52,7 @@ internal partial class CanvasBlit
     }
 
     // Vortice.DXGI 3.3.4 does not map IDXGIResource::GetSharedHandle either -
-    // declare it manually. FIXED 2026-11-16: old GUID was a different dxgi interface, NOT IDXGIResource. Correct IID from Windows 10 SDK dxgi.h:
-    // MIDL_INTERFACE("035f3ab4-482e-4e50-b41f-8a7f8bd8960b").
-    // Vtable: IDXGIObject (4) + IDXGIDeviceSubObject (GetDevice) +
-    // IDXGIResource (GetUsage, SetEvictionPriority, GetEvictionPriority,
-    // GetSharedHandle).
+    // declare it manually (IID from Win10 SDK dxgi.h).
     [ComImport, Guid("035f3ab4-482e-4e50-b41f-8a7f8bd8960b"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     internal interface IDXGIResourceRaw
     {
@@ -96,7 +83,7 @@ internal partial class CanvasBlit
     private static D3D.ID3D11DeviceContext _ctx;
     private static D3D.ID3D11ShaderResourceView _canvasSrv;
     private static D3D.ID3D11RenderTargetView _canvasRtv;
-    private static D3D.ID3D11Texture2D _canvasTex2d;   // the raw D3D11 canvas (for lane CopyResource)
+    private static D3D.ID3D11Texture2D _canvasTex2d;   // the raw canvas (for lane CopyResource)
     private static D3D.ID3D11VertexShader _vs;
     private static D3D.ID3D11PixelShader _ps;
     private static D3D.ID3D11InputLayout _layout;
@@ -105,13 +92,10 @@ internal partial class CanvasBlit
     private static D3D.ID3D11SamplerState _samplerPoint;
     private static int _canvasW, _canvasH;
 
-    // Same blit as the Pie-side shader in RenderWindow, as plain HLSL. The
-    // vertex layout matches Pie's VPosUv packing: float2 pos + float2 uv in
-    // one Vector4 (16 bytes). POSITION is 2 floats - declaring R32G32B32 here
-    // made position.z read uvX and left SV_Position.w undefined, which the
-    // rasterizer divides by (the monitor-2 distortion bug). The blend is
-    // baked in at compile time. NOTE: it is formatted with "0.0###" - both
-    // GLSL and HLSL reject a bare "0f"/"1f" float literal.
+    // The Pie-side blit shader as plain HLSL. POSITION is 2 floats - declaring
+    // R32G32B32 here made position.z read uvX and left SV_Position.w undefined
+    // (the monitor-2 distortion bug). The blend is baked in at compile time
+    // and formatted with "0.0###" - HLSL rejects a bare "0f"/"1f" literal.
     internal static string BuildHlsl(float blend) => $@"
 struct VI {{ float2 pos : POSITION; float2 uv : TEXCOORD0; }};
 struct VO {{ float4 pos : SV_Position; float2 uv : TEXCOORD0; }};
@@ -128,8 +112,8 @@ float4 PS(VO i) : SV_Target
 }}";
 
     // One-time setup on the owner window's device: pull the raw D3D11 device
-    // and context out of the Pie wrapper (same reflection the diag modes
-    // use), wrap the canvas texture, compile the blit.
+    // and context out of the Pie wrapper, wrap the canvas texture, compile
+    // the blit.
     internal static void EnsureShared(RenderWindow owner)
     {
         if (_dev != null) return;
@@ -169,10 +153,7 @@ float4 PS(VO i) : SV_Target
         LogOwnerSwapchain(pieDev);
     }
 
-    // One-time diagnostics: what model is the OWNER's own (Pie-managed)
-    // swapchain? If it is legacy bitblt, the owner's Present is the one
-    // path that still does a synchronous DWM-synced copy per frame and it
-    // cannot get ALLOW_TEARING/waitable treatment from our side.
+    // Diagnostic: what model is the owner's own (Pie-managed) swapchain?
     private static void LogOwnerSwapchain(object pieDev)
     {
         try
@@ -201,14 +182,12 @@ float4 PS(VO i) : SV_Target
         }
     }
 
-    // Plain DXGI swapchain for a non-owner window (Pie has no API for a
-    // second swapchain on one device).
-    // FRAME_LATENCY_WAITABLE_OBJECT + SetMaximumFrameLatency(3): moves any
-    // "too many frames queued" blocking OUT of Present into a waitable
-    // handle the loop checks at the start of each frame (Microsoft DXGI 1.3
-    // latency model). With consumption (>=144 Hz) faster than production
-    // (<=120 fps) the handle is always signaled, so waits return instantly
-    // and Present becomes a pure queue push.
+    // Plain DXGI swapchain for a non-owner window. Flip model + deep queue +
+    // FRAME_LATENCY_WAITABLE_OBJECT (DXGI 1.3 latency model): the waitable
+    // wait happens explicitly at frame start, Present stays a pure queue push.
+    // AllowTearing enables independent flip (presents go straight to scanout).
+    // Blt model: neither flag is supported; Scaling.Stretch is required for
+    // windowed blt; windowed blt cannot tear anyway.
     internal static IDXGISwapChain1 CreateSwapchain(IntPtr hwnd, int w, int h,
         out IntPtr waitable, int buffers = 4, int latency = 3, D3D.ID3D11Device dev = null,
         bool blt = false)
@@ -225,36 +204,13 @@ float4 PS(VO i) : SV_Target
             Stereo = false,
             SampleDescription = new SampleDescription(1, 0),
             BufferUsage = Usage.RenderTargetOutput,
-            // Flip model with TWO buffers: presents become cheap queue
-            // operations (the old 1-buffer bitblt model did a synchronous
-            // copy that stalled the CPU ~6ms/frame on DWM sync). DWM picks
-            // each buffer up at THIS monitor's own vblank. The caller must
-            // create one RTV per buffer and render into the CURRENT one
-            // (IDXGISwapChain3.CurrentBackBufferIndex) - flip rotates
-            // buffers, a single cached RTV would present stale frames.
-            // 4 buffers (default): with 2, each Present(0) blocks until the
-            // previous frame's flip completes at a vblank (buffer release
-            // sync) - measured as a constant ~5.9ms stall per present. A
-            // deeper queue lets presents return immediately while scanout
-            // drains it. Configurable via swap_buffers (2..8) for the
-            // "fake vsync with extra buffers" experiment.
+            // Caller must create one RTV per buffer and render into the
+            // CURRENT one (GetBuffer(0)) - flip rotates buffers, a cached RTV
+            // would present stale frames.
             BufferCount = buffers,
-            // Latency 3 (one below the 4-buffer queue): queued presents may
-            // reach 3 before anything blocks, and that block is our explicit
-            // waitable wait, not a hidden one inside Present.
-            // Blt model (raw_swap_blt experiment): Scaling.None requires the
-            // flip model; windowed blt needs Stretch. Buffer count comes from
-            // the caller (1 or 2 - 1-buffer blt measured ~6ms release sync).
             Scaling = blt ? Scaling.Stretch : Scaling.None,
             SwapEffect = blt ? SwapEffect.Discard : SwapEffect.FlipDiscard,
             AlphaMode = AlphaMode.Ignore,
-            // AllowTearing: enables "independent flip" - presents go straight
-            // to scanout without waiting on DWM's compose pass. Without it the
-            // per-present DWM buffer-release sync cost ~6ms/frame on this
-            // setup (one 170Hz compose period per Present(0, DO_NOT_WAIT)).
-            // Blt model: neither flag is supported (AllowTearing throws,
-            // waitable needs the flip queue); windowed blt cannot tear anyway
-            // (DWM composes from its own copy of the buffer).
             Flags = blt ? 0
                 : SwapChainFlags.AllowTearing | SwapChainFlags.FrameLatencyWaitableObject,
         };
@@ -264,9 +220,6 @@ float4 PS(VO i) : SV_Target
         {
             try
             {
-                // Vortice exposes the DXGI 1.3 latency API as C# properties on
-                // IDXGISwapChain2 (get_/set_MaximumFrameLatency and
-                // get_FrameLatencyWaitableObject in the assembly metadata).
                 using var sc2 = sc.QueryInterface<IDXGISwapChain2>();
                 sc2.MaximumFrameLatency = latency;
                 waitable = sc2.FrameLatencyWaitableObject;
@@ -279,11 +232,8 @@ float4 PS(VO i) : SV_Target
         return sc;
     }
 
-    // One RTV per frame, fetched from GetBuffer(0): in D3D11 flip-model
-    // swapchains, buffer 0 ALWAYS refers to the current back buffer (the
-    // runtime rotates buffers underneath), and GetBuffer(index > 0) is
-    // invalid. Creating the RTV per frame costs microseconds - far below
-    // the ~6ms/frame the old blt-model present used to stall.
+    // One RTV per frame from GetBuffer(0): in flip-model swapchains buffer 0
+    // ALWAYS refers to the current back buffer (buffers rotate underneath).
     internal static D3D.ID3D11RenderTargetView CreateCurrentBackbufferRtv(IDXGISwapChain1 swap, D3D.ID3D11Device dev = null)
     {
         using var tex = swap.GetBuffer<D3D.ID3D11Texture2D>(0);

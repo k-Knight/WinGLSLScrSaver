@@ -1,16 +1,12 @@
 namespace WinGLSLScrSaver;
 
-// Partial of RenderWindow: the --diag=4/5/6 pixel-readback helpers (sampled pixel logs).
-// Split from RenderWindow.cs for maintainability - same class, zero
-// behavior change. Core lifecycle, fields and Render() live in RenderWindow.cs.
+// Partial of RenderWindow: --diag=4/5/6 pixel-readback helpers.
 
 using System.Reflection;
 using D3D = Vortice.Direct3D11;
 
 internal partial class RenderWindow
 {
-    // ---- DIAG 4 helpers ------------------------------------------------------
-
     // Both readback helpers pull Pie's raw immediate context out the same way.
     private D3D.ID3D11DeviceContext DiagCtx() =>
         (D3D.ID3D11DeviceContext) _device.GetType().GetField("_context",
@@ -23,9 +19,7 @@ internal partial class RenderWindow
             var ctx = DiagCtx();
             var dev = (D3D.ID3D11Device) _d3dDevice;
 
-            // Fresh staging texture per dump - same pattern as DumpD3DTex.
-            // (The old shared _stagingTex field was never assigned, so this
-            // readback used to copy from a null texture and always failed.)
+            // Fresh staging texture per dump.
             var sdesc = _backTex.Description;
             sdesc.Usage = D3D.ResourceUsage.Staging;
             sdesc.BindFlags = D3D.BindFlags.None;

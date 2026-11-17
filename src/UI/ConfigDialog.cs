@@ -28,7 +28,7 @@ internal class ConfigDialog : Form
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MinimizeBox = MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        AutoScaleMode = AutoScaleMode.Dpi; // keep fixed-pixel layout intact at 125%/150% display scaling
+        AutoScaleMode = AutoScaleMode.Dpi; // keep fixed-pixel layout intact at 125%/150% scaling
         ClientSize = new Size(484, 610);
 
         // ---- row 1: shader folder ----
@@ -40,8 +40,6 @@ internal class ConfigDialog : Form
             "Folder that is scanned for fragment shaders (.fs); a random one is picked each time the saver starts.\n\n" +
             "Empty = %LocalAppData%\\WinGLSLScrSaver (the default shader location).\n\n" +
             "Use Browse... to pick the folder instead of typing the path.");
-        // Default to the local app data dir (where shaders are searched when
-        // nothing is configured) instead of an empty box.
         _folderBox = new TextBox
         {
             Location = new Point(40, 40), Width = 320,
@@ -311,8 +309,8 @@ internal class ConfigDialog : Form
         CancelButton = cancel;
     }
 
-    // A small square "?" button placed next to a label; click = full help
-    // popup, hover = one-line tooltip.
+    // A small square "?" button next to a label; click = help popup,
+    // hover = one-line tooltip.
     private Button NewHelpButton(int x, int y, string tip, string title, string body)
     {
         var b = new Button { Text = "?", Location = new Point(x, y), Size = new Size(22, 22) };

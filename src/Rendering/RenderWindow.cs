@@ -19,7 +19,6 @@ internal partial class RenderWindow : Form
     private readonly SizeF _fitted;         // fitted image size in group canvas
     private readonly PointF _letterbox;     // fitted image offset in group canvas
 
-    // Scaled-path settings (Program-level config, per-window copy).
     private readonly float _resMult;        // 0.05..1.0; < 1 = render small, upscale
     private readonly float _scaleBlend;     // 0 = nearest, 1 = bilinear, between = mix
     private bool ScaledPath => _resMult < 1f && _rt != null;
@@ -40,13 +39,12 @@ internal partial class RenderWindow : Form
     private SamplerState _sampler;
     private SamplerState _pointSampler;   // scaled path: nearest neighbour
     private GraphicsBuffer _blitQuadStatic; // scaled path: static fullscreen blit quad
-    private int _rtW, _rtH;               // scaled path RT size (Texture has no size query)
+    private int _rtW, _rtH;
     private bool _disposed;
 
     // ---- Shared canvas architecture (normal runs, diag=0): window 0 hosts
     // the Pie device and renders the shader ONCE per frame into a master-size
-    // canvas RT; every window (window 0 included) blits its crop-to-fit slice
-    // with raw D3D11 calls on that same device (CanvasBlit).
+    // canvas RT; every window blits its crop-to-fit slice on that device.
     internal bool IsCanvasOwner;
     private bool _isRawWindow;
     private DXGI.IDXGISwapChain1 _rawSwap;
@@ -60,10 +58,9 @@ internal partial class RenderWindow : Form
     internal int CanvasH => _rtH;
     internal float ScaleBlend => _scaleBlend;
     internal DXGI.IDXGISwapChain1 RawSwap => _rawSwap;
-    // Raw windows blit into their own swapchain's backbuffer. The owner never
-    // does a raw blit - it blits its slice through Pie (framebuffer null).
-    // Flip model: CanvasBlit.Draw fetches the current back buffer (GetBuffer(0))
-    // and creates its RTV per frame - no cached RTV is possible.
+    // Raw windows blit into their own swapchain's backbuffer. Flip model:
+    // CanvasBlit.Draw fetches the current back buffer (GetBuffer(0)) and
+    // creates its RTV per frame - no cached RTV is possible.
     internal D3D.ID3D11Buffer RawVb => _rawVb;
     internal int RawW => ClientSize.Width;
     internal int RawH => ClientSize.Height;
@@ -76,8 +73,7 @@ internal partial class RenderWindow : Form
     };
     private static readonly uint[] QuadIndices = { 0u, 1u, 3u, 1u, 2u, 3u };
 
-    // The fullscreen blit quad (TR, BR, BL, TL) - one shared definition for
-    // the sites that used to repeat the same literal: the diag-6 control
+    // Fullscreen blit quad (TR, BR, BL, TL) - shared by the diag-6 control
     // buffer, the scaled-path static blit quad and the diag 1/4/6 fills.
     private static readonly VPosUv[] FullscreenQuad = new VPosUv[]
     {
@@ -99,38 +95,27 @@ internal partial class RenderWindow : Form
 
     public bool ShutdownRequested { get; private set; }
 
-    // 1 = present with vsync (auto mode, today's behavior); 0 = present
-    // immediately without blocking (used when an FPS cap is set, so the
-    // render loop is paced purely by the cap - monitors sample the latest
-    // buffer at their own refresh). Set by RunLoop before the loop starts.
+    // 1 = present with vsync (auto mode); 0 = present without blocking (FPS
+    // cap set - the loop is paced by the cap). Set by RunLoop before the loop.
     public int PresentInterval = 1;
 
-    // ---- Per-monitor present pacing (Option A, fullscreen canvas runs) ---
-    // The render loop is paced by the fastest display (or fps_cap); every
-    // window gates its own blit+present to its monitor's refresh rate, so a
-    // mixed-refresh setup no longer runs everything at the slowest rate.
+    // ---- Per-monitor present pacing (fullscreen canvas runs) ---------------
     internal double RefreshHz = 60.0;   // this monitor's actual refresh rate
     internal bool PresentGating;        // set by RunLoop for fullscreen canvas runs
     private double _nextPresentDue;     // due time in loop-stopwatch seconds
     public long PresentFrames;          // presents actually handed to DWM
     private bool _dwnLogged;            // WasStillDrawing warning (once)
 
-    // ---- Present thread (fix C, present_threads=1) -------------------------
-    // The raw window's Present(0) costs ~one DWM composition period (~5.9ms
-    // on the 170Hz primary) even with DO_NOT_WAIT - the driver syncs the
-    // flip to the composition phase. Running that wait on a dedicated thread
-    // takes it out of the render loop's frame budget. The main thread only
-    // hands off a flag + timestamp; the thread calls the actual DXGI present.
-    // Device-context calls stay on the main thread - D3D11's
-    // immediate context is not thread-safe; swapchain Present is.
+    // ---- Present thread ----------------------------------------------------
+    // Raw Present(0) costs ~one DWM composition period even with DO_NOT_WAIT;
+    // running that wait on a dedicated thread takes it out of the frame
+    // budget. Only swapchain presents run there - the device context stays
+    // on the main thread (D3D11 immediate context is not thread-safe).
     internal bool UsePresentThread;
     // True while the present thread is inside a swapchain operation on this
-    // window (LaneDraw's GetBuffer, or Present itself). The main thread must
-    // not touch the same swapchain concurrently: GetBuffer(0) / RTV creation
-    // / ResizeBuffers while a Present is in flight is driver-level undefined
-    // behavior - this is the ~1-in-5 launch AV (c0000005) with present
-    // threads on. The present thread sets/clears it; the main thread waits
-    // briefly and then skips that tick's swapchain access (one stale frame).
+    // window. The main thread must not touch the same swapchain concurrently:
+    // GetBuffer / RTV creation / ResizeBuffers during an in-flight Present is
+    // driver-level UB (the ~1-in-5 launch AV with present threads on).
     private volatile bool _presentInFlight;
     internal bool PresentInFlight => _presentInFlight;
     private Thread _presentThread;
@@ -140,11 +125,9 @@ internal partial class RenderWindow : Form
     private volatile bool _presentQueued;
 
     // ---- Present lane (present_lanes=2) ------------------------------------
-    // This window's swapchain lives on a SECOND D3D11 device (CanvasBlit lane
-    // device) and its blit+present run there from the present thread - a
-    // fully parallel present lane, bypassing the one-device serialization
-    // that caps the loop at ~83 fps. The canvas crosses devices through a
-    // keyed-mutex shared texture (device1 copies it once per tick).
+    // This window's swapchain lives on a SECOND D3D11 device (a fully
+    // parallel present lane); the canvas crosses devices via a keyed-mutex
+    // shared texture.
     internal bool UseLane;
     private DXGI.IDXGISwapChain1 _laneSwap;
     private IntPtr _laneWaitable;
@@ -180,9 +163,8 @@ internal partial class RenderWindow : Form
         _presentExit.Reset();
     }
 
-    // Main thread: hand the present off. Coalescing: if the thread is still
-    // busy with the previous present, the event just latches and the next
-    // present happens when it frees up (natural backpressure).
+    // Hand the present off. Coalescing: if the thread is still busy with the
+    // previous present, the event just latches (natural backpressure).
     private void RequestPresent(float time)
     {
         _presentThreadTime = time;
@@ -210,8 +192,7 @@ internal partial class RenderWindow : Form
     private const int DXGI_PRESENT_ALLOW_TEARING = 0x00000200;
     private const int DXGI_ERROR_WAS_STILL_DRAWING = unchecked((int) 0x887A000A);
 
-    // Cheap per-frame timing probes (read+reset by RunLoop's FPS log): where
-    // does the frame budget actually go - draw, presents, pacing?
+    // Per-frame timing probes (read+reset by RunLoop's FPS log).
     internal static double OwnerPresentTotalMs;
     internal static double RawPresentTotalMs;
     internal static long RawWasStillCount;
@@ -219,24 +200,21 @@ internal partial class RenderWindow : Form
     internal static double RawPresentMaxMs;
     internal static double OwnerPresentMinMs = double.MaxValue;
     internal static double OwnerPresentMaxMs;
-    // Waitable-object wait times (raw windows): should be ~0ms when the
-    // present queue drains faster than we fill it; sustained >0 means the
-    // driver is applying backpressure and we are genuinely queue-limited.
+    // Waitable wait times: ~0ms when the queue drains; sustained >0 = queue-limited.
     internal static double FrameLatencyWaitTotalMs;
     internal static double FrameLatencyWaitMaxMs;
     internal static long FrameLatencyWaitCount;
     internal static int RawPresentFlagMode = 2;
 
     // show_fps=1: per-window fps overlay counting ACTUAL presented frames
-    // (post gating) - not render ticks - so the number is what the user sees.
+    // (post gating), not render ticks.
     private Label _fpsLabel;
     private long _fpsLabelFrames;
     private double _fpsLabelT;
 
     // tear_fix_child=1 (with show_fps off): a fully transparent child window
-    // over the flip swapchain - the same DWM-composition hack the fps label
-    // provides (a child HWND over the swapchain forces DWM-composed,
-    // vblank-synced presentation), but invisible: layered child with alpha 0.
+    // over the flip swapchain - the same DWM-composition hack as the fps
+    // label, but invisible (layered child with alpha 0).
     private Control _tearFixChild;
 
     private static Cursor _hiddenCursor;
@@ -267,16 +245,14 @@ internal partial class RenderWindow : Form
         KeyPreview = true;
         TopMost = !isPreview;
 
-        // Never paint white: even before the first GPU frame, any window
-        // surface exposed must be black (white startup flash report).
+        // Never paint white: any window surface exposed before the first GPU
+        // frame must be black (white startup flash report).
         BackColor = Color.Black;
         SetStyle(ControlStyles.Opaque | ControlStyles.AllPaintingInWmPaint, true);
 
         // Hide the cursor on EVERY window, not just the canvas owner: raw
-        // windows 1..N never run InitGraphics, so the cursor stayed visible
-        // on all non-primary monitors. Setting it here (constructor) covers
-        // every init path; child controls (fps label, tear-fix child) inherit
-        // the parent cursor via Control.Cursor, so they stay hidden too.
+        // windows 1..N never run InitGraphics. Child controls (fps label,
+        // tear-fix child) inherit the parent cursor via Control.Cursor.
         if (!isPreview) Cursor = HiddenCursor();
 
         _master = master;
@@ -309,8 +285,8 @@ internal partial class RenderWindow : Form
                 return false;
             }
 
-            // NOTE: Debug=true is FORBIDDEN - Pie 0.10.1's DebugGraphicsDevice
-            // wrapper throws SEHException natively on SetDepthStencilState here.
+            // Debug=true is FORBIDDEN - Pie 0.10.1's DebugGraphicsDevice throws
+            // SEHException natively on SetDepthStencilState here.
             _device = GraphicsDevice.CreateD3D11(hwnd, cs, new GraphicsDeviceOptions { Debug = false });
             Log.W("InitGraphics: D3D11 device created");
 
@@ -334,14 +310,9 @@ void main()
     gl_Position = vec4(aPosUv.xy, 0.0, 1.0);
 }";
 
-            // Blit fragment with the interpolation blend BAKED IN as a compile
-            // constant (the setting is fixed for the whole run, and a spec
-            // constant would have to survive shaderc -> SPIRV-Cross -> HLSL -
-            // not worth the risk). 0 = pure nearest neighbour, 1 = pure
-            // bilinear; between = per-pixel weighted mix of the two.
-            // NOTE: the blend is formatted with "0.0###" (not "0.####") - GLSL
-            // forbids a bare "0f"/"1f"; a float literal needs a decimal point
-            // or exponent, so 0 and 1 must come out as 0.0 / 1.0.
+            // Blit fragment with the interpolation blend BAKED IN (a spec
+            // constant would have to survive shaderc -> SPIRV-Cross -> HLSL).
+            // Formatted with "0.0###": GLSL forbids a bare "0f"/"1f" literal.
             string BlitFragment = $@"
 #version 450
 layout (location = 0) in vec2 vUv;
@@ -379,24 +350,20 @@ void main()
             _indexBuffer = _device.CreateBuffer(BufferType.IndexBuffer, QuadIndices);
             _uniform = _device.CreateBuffer(BufferType.UniformBuffer, Vector4.Zero, true);
 
-            // RT / blit machinery is needed by --diag modes AND by the scaled
-            // path (res_mult < 1.0: shader renders into a smaller RT that is
-            // upscaled to the screen by the blit pass). At res_mult == 1.0
-            // with no diag the normal path renders straight to the backbuffer.
+            // RT / blit machinery: diag modes AND the scaled path. At
+            // res_mult == 1.0 with no diag the normal path renders straight
+            // to the backbuffer.
             if (!Program.CanvasPipeline || IsCanvasOwner)
             {
                 // Normal runs: the blit VB holds this window's canvas-slice
-                // quad (crop-to-fit UV window into the shared canvas).
-                // Diag modes: the fullscreen letterbox blit quad.
+                // quad; diag modes: the fullscreen letterbox blit quad.
                 _blitVb = _device.CreateBuffer(BufferType.VertexBuffer,
                     Program.CanvasPipeline ? ComputeCanvasVerts() : ComputeBlitVerts());
-                // DIAG 6: static control buffer (kept for repro runs).
                 _blitVbStatic = _device.CreateBuffer(BufferType.VertexBuffer, FullscreenQuad);
 
-                // RT sizes: diag 5/6 need the master-size RT for their pixel
-                // readbacks; other diag modes use client x mult; a normal run
-                // (diag=0, owner window) uses the SHARED CANVAS at master size
-                // x mult - the shader renders into it once per frame.
+                // RT sizes: diag 5/6 need the master-size RT for readbacks;
+                // other diag modes use client x mult; a normal run uses the
+                // SHARED CANVAS at master size x mult.
                 int rtW, rtH;
                 if (Program.DiagMode is 5 or 6) { rtW = _master.Width; rtH = _master.Height; }
                 else if (Program.CanvasPipeline)
@@ -420,10 +387,9 @@ void main()
             }
 
             // (Cursor hiding moved to the constructor: raw windows 1..N never
-            // reach InitGraphics, so the cursor must be hidden for all of them.)
+            // reach InitGraphics.)
 
-            // Normal runs: this window hosts the shared device - set up the
-            // canvas wrap + raw blit that ALL windows (itself included) use.
+            // Normal runs: this window hosts the shared device.
             if (Program.CanvasPipeline && IsCanvasOwner)
                 CanvasBlit.EnsureShared(this);
 
@@ -488,10 +454,7 @@ void main()
         if (_disposed) return;
         if (Program.CanvasPipeline)
         {
-            // Shared canvas path: DRAW phase only - presents happen later,
-            // after every window has drawn, so no draw command ever sits
-            // behind a flip in the GPU queue (a flip cannot retire before a
-            // vblank; work queued behind it stalls the whole pipeline).
+            // Shared canvas path: DRAW phase only (presents happen in Present()).
             CanvasDraw(time);
             return;
         }
@@ -500,15 +463,14 @@ void main()
         int w = ClientSize.Width, h = ClientSize.Height;
         if (w <= 0 || h <= 0) return;
 
-        // ---- DIAG 5: (a) gradient into the RT (plain texture) + readback,
-        // (b) magenta clear on the backbuffer, no draw, + readback.
-        // Decides: broken draw pipeline vs broken swapchain/present path.
+        // ---- DIAG 5: (a) gradient into the RT + readback, (b) magenta clear
+        // on the backbuffer, no draw, + readback. Decides: broken draw
+        // pipeline vs broken swapchain/present path.
         if (Program.DiagMode == 5)
         {
-            // (a) RT pass with the gradient fragment + quadVb/mainLayout.
             _device.SetFramebuffer(_fb);
             _device.Viewport = new Rectangle(0, 0, _master.Width, _master.Height);
-            _device.ClearColorBuffer(0f, 1f, 0f, 1f); // green background in RT
+            _device.ClearColorBuffer(0f, 1f, 0f, 1f);
             _device.UpdateBuffer(_uniform, 0, new Vector4(_master.Width, _master.Height, 1f, time));
             _device.SetShader(_mainShader);
             _device.SetUniformBuffer(0u, _uniform);
@@ -525,7 +487,6 @@ void main()
                 _diagDone = true;
                 DumpD3DTex(_rtRT, "RT");
 
-                // (b) backbuffer: magenta clear ONLY, no draw.
                 _device.SetFramebuffer(null);
                 _device.Viewport = new Rectangle(0, 0, w, h);
                 _device.ClearColorBuffer(1f, 0f, 1f, 1f); // MAGENTA
@@ -536,9 +497,8 @@ void main()
             return;
         }
 
-        // ---- DIAG 6: isolate the broken blit component. All draws go into the
-        // RT (readable): A=main path (control), B=blit with DYNAMIC VB filled
-        // via UpdateBuffer, C=blit with STATIC VB (initial data).
+        // ---- DIAG 6: isolate the broken blit component. A=main path (control),
+        // B=blit with DYNAMIC VB via UpdateBuffer, C=blit with STATIC VB.
         if (Program.DiagMode == 6)
         {
             _diagFrames++;
@@ -580,7 +540,6 @@ void main()
                 _device.DrawIndexed(6u);
                 DumpD3DTex(_rtRT, "RT-C-blit-static");
 
-                // Restore backbuffer OM state.
                 _device.SetFramebuffer(null);
                 _device.Viewport = new Rectangle(0, 0, w, h);
             }
@@ -588,9 +547,7 @@ void main()
             return;
         }
 
-        // ---- DIAG 1/4: gradient straight to the backbuffer (proves the blit
-        // geometry / rasterizer path without touching the RT or user shader).
-        // Diag 4 additionally reads pixels back.
+        // ---- DIAG 1/4: gradient straight to the backbuffer (4 adds readback).
         if (Program.DiagMode is 1 or 4)
         {
             _device.SetFramebuffer(null);
@@ -618,15 +575,13 @@ void main()
             return;
         }
 
-        // ---- Scaled path (res_mult < 1.0): Pass A renders the shader into the
-        // small RT, Pass B upscales it to the backbuffer with the blended
-        // sampler (nearest <-> bilinear). Both vertex buffers are STATIC -
-        // Pie 0.10.1's UpdateBuffer on dynamic VBs silently fails.
+        // ---- Scaled path (res_mult < 1.0): Pass A renders into the small RT,
+        // Pass B upscales to the backbuffer with the blended sampler. Both
+        // VBs are STATIC - Pie 0.10.1's UpdateBuffer on dynamic VBs fails.
         if (ScaledPath)
         {
             int rtW = _rtW, rtH = _rtH;
 
-            // Pass A: shader into RT at the monitor's own aspect ratio.
             _device.SetFramebuffer(_fb);
             _device.Viewport = new Rectangle(0, 0, rtW, rtH);
             _device.UpdateBuffer(_uniform, 0, new Vector4(rtW, rtH, 1f, time));
@@ -639,7 +594,6 @@ void main()
             _device.SetIndexBuffer(_indexBuffer, IndexType.UInt);
             _device.DrawIndexed(6u);
 
-            // Pass B: upscale RT to the screen with both samplers blended.
             _device.SetFramebuffer(null);
             _device.Viewport = new Rectangle(0, 0, w, h);
             _device.SetShader(_blitShader);
@@ -656,12 +610,9 @@ void main()
             return;
         }
 
-        // ---- Single-pass direct rendering (crop-to-fill, res_mult == 1.0).
-        // The shader renders at THIS monitor's native resolution and fills it
-        // edge-to-edge - uv 0..1 spans the whole screen, exactly like
-        // ShaderRunner fullscreen. No shared max-resolution canvas, no
-        // letterbox bars. (The old master-canvas + slice blit is only used by
-        // --diag modes now.)
+        // ---- Single-pass direct rendering (res_mult == 1.0): the shader
+        // renders at THIS monitor's native resolution, uv 0..1 spans the
+        // whole screen.
         _device.SetFramebuffer(null);
         _device.Viewport = new Rectangle(0, 0, w, h);
         Vector4 resolutionTime = new Vector4(w, h, 1f, time);
@@ -682,11 +633,10 @@ void main()
         _device.SetIndexBuffer(_indexBuffer, IndexType.UInt);
         _device.DrawIndexed(6u);
 
-        _device.Present(PresentInterval); // Auto mode = 1 (vsync): Present(0)+AllowTearing
-                            // silently fails on some drivers (Pie ignores the DXGI
-                            // result), leaving black screens. With an FPS cap set the
-                            // interval is 0 and pacing is the loop's job - tearing is
-                            // accepted there by design.
+        _device.Present(PresentInterval); // auto mode = 1 (vsync): Present(0)+
+                            // AllowTearing silently fails on some drivers
+                            // (Pie ignores the DXGI result), leaving black
+                            // screens. With an FPS cap the interval is 0.
     }
 
     private void RequestShutdown()
@@ -707,11 +657,10 @@ void main()
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        // Black, never the default light background (white flash report).
-        e.Graphics.Clear(Color.Black);
+        e.Graphics.Clear(Color.Black); // never the default light background
     }
 
-    private const int WM_DISPLAYCHANGE = 0x007E; // display mode / topology changed
+    private const int WM_DISPLAYCHANGE = 0x007E;
 
     protected override void WndProc(ref Message m)
     {
@@ -740,8 +689,7 @@ void main()
         try
         {
             _device?.ResizeSwapchain(new Size(ClientSize.Width, ClientSize.Height));
-            // Rebuild the static blit VB for the new client geometry (canvas
-            // slice quad in normal runs, fullscreen letterbox quad in diag).
+            // Rebuild the static blit VB for the new client geometry.
             if (_device != null && _blitVb != null)
             {
                 _blitVb.Dispose();
@@ -749,9 +697,8 @@ void main()
                     Program.CanvasPipeline ? ComputeCanvasVerts() : ComputeBlitVerts());
                 Log.W($"OnResize: blit VB rebuilt for {ClientSize.Width}x{ClientSize.Height}");
             }
-            // Scaled path only (per-window RTs, diag 3 style): rebuild the RT
-            // at client size x multiplier. The shared canvas RT is master
-            // sized and must NOT follow window resizes.
+            // Scaled path only: rebuild the RT at client size x multiplier.
+            // The shared canvas RT is master sized and must NOT follow resizes.
             if (_device != null && _rt != null && _resMult < 1f && !Program.CanvasPipeline)
             {
                 int rtW = Math.Max(1, (int) Math.Round(ClientSize.Width * _resMult));
@@ -768,4 +715,3 @@ void main()
         catch (Exception ex) { Log.Ex("OnResize/ResizeSwapchain", ex); }
     }
 }
-

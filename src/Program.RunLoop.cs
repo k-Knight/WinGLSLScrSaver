@@ -1,9 +1,7 @@
 namespace WinGLSLScrSaver;
 
-// Partial of Program: the render loop (RunLoop) with the fps pacing
-// engine (grid/rel/pi), per-window present gating and the FPS/diag stats
-// logging. Split from Program.cs for maintainability - same class, zero
-// behavior change. Entry point, modes and setup live in Program.cs.
+// Partial of Program: the render loop, fps pacing (grid/rel/pi), per-window
+// present gating and FPS/diag stats. Entry point lives in Program.cs.
 
 using System.Diagnostics;
 
@@ -11,17 +9,13 @@ internal partial class Program
 {
     private static void RunLoop(List<RenderWindow> windows, int targetFps, int fpsCap = 0)
     {
-        // Init graphics BEFORE showing: the device still binds to the final
-        // window handle (created on demand here; preview reparenting already
-        // happened in RunPreview), and the first frame is on the swapchain by
-        // the time the window becomes visible - no white flash at startup.
+        // Init graphics BEFORE showing: device binds to the final handle and
+        // the first frame is ready when the window becomes visible (no white flash).
         int okCount = 0;
         if (Program.CanvasPipeline && windows.Count > 0)
         {
-            // Shared canvas architecture: window 0 hosts the (only) device and
-            // renders the shader once per frame into the canvas; the rest are
-            // raw DXGI swapchain windows blitting their slice on that device.
-            // (--diag=7 selects this same pipeline: verbose logging only.)
+            // Window 0 hosts the only device and renders the canvas; the rest
+            // are raw DXGI swapchain windows blitting their slice.
             windows[0].IsCanvasOwner = true;
             if (windows[0].InitGraphics(VertexShaderStatic, FragmentShaderStatic))
             {
@@ -33,7 +27,7 @@ internal partial class Program
         }
         else
         {
-            // --diag modes keep the per-window devices (pixel readbacks etc.).
+            // Diag modes keep per-window devices (pixel readbacks etc.).
             foreach (var w in windows)
                 if (w.InitGraphics(VertexShaderStatic, FragmentShaderStatic))
                     okCount++;
@@ -49,29 +43,21 @@ internal partial class Program
         foreach (var w in windows) w.Show();
         if (windows.Count > 0 && !windows[0].IsPreview)
             windows[0].Activate();
-        // Option A (fullscreen canvas runs): the loop is paced by the timer
-        // at the fastest refresh (or the fps cap), presents never block, and
-        // each monitor gates its own presents to its own refresh rate - a
-        // mixed-refresh setup no longer runs everything at the slowest
-        // monitor's rate. Preview and diag 1-6 keep the old vsync/cap path.
+        // Fullscreen canvas runs: loop paced by timer, presents never block,
+        // each monitor gates its own presents to its own refresh rate.
         bool canvasMode = Program.CanvasPipeline
             && windows.Count > 0 && !windows[0].IsPreview;
         if (canvasMode)
             foreach (var w in windows) w.PresentGating = true;
-        // Gated canvas runs: presents must not block on vblank (interval 0); a
-        // not-ready raw swapchain is handled by DXGI_PRESENT_DO_NOT_WAIT.
-        // Other modes keep today's behavior (vsync in auto, Present(0) with cap).
         int presentInterval = canvasMode || fpsCap > 0 ? 0 : 1;
         foreach (var w in windows) w.PresentInterval = presentInterval;
         Log.W($"All windows shown (presentInterval={presentInterval}, gating={canvasMode})");
 
-        // Present threads (fix C) + present lanes (fix E): each non-owner
-        // window presents from its own thread; with present_lanes=2 it also
-        // presents from its own D3D11 device (a second, fully parallel
-        // present lane), because Present calls on ONE device serialize at
-        // DWM composition granularity (~5.9ms each -> ~83 fps ceiling for
-        // two windows). The owner stays on the main thread - the Pie device
-        // context is not thread-safe and its present is cheap.
+        // Present threads + lanes: each non-owner window presents from its own
+        // thread and (lanes=2) its own D3D11 device, because Present calls on
+        // ONE device serialize at DWM composition granularity (~5.9ms each).
+        // The owner stays on the main thread - the Pie device context is not
+        // thread-safe and its present is cheap.
         bool lanes = canvasMode && Cfg.PresentLanes == 2;
         bool usePresentThreads = canvasMode && (Cfg.PresentThreads || lanes);
         if (usePresentThreads)
@@ -86,18 +72,12 @@ internal partial class Program
 
         var sw = Stopwatch.StartNew();
         var frame = TimeSpan.FromMilliseconds(1000.0 / targetFps);
-        // Timer-paced modes: any FPS cap, and fullscreen canvas runs (auto =
-        // paced at the fastest display's refresh; presents are not vsynced
-        // there any more - each monitor paces itself via per-window gating).
-        // Sleep(1) alone is unreliable here - since Win10 2004 the raised
-        // timer resolution only applies to the FOCUSED process, and a
-        // screensaver never has focus.
+        // Timer-paced modes: any FPS cap, and fullscreen canvas runs. Sleep(1)
+        // is unreliable here - since Win10 2004 raised timer resolution only
+        // applies to the FOCUSED process, and a screensaver never has focus.
         bool timerPaced = canvasMode || fpsCap > 0;
         int paceFps = fpsCap > 0 ? fpsCap : targetFps;
         var capFrame = timerPaced ? TimeSpan.FromMilliseconds(1000.0 / paceFps) : TimeSpan.Zero;
-        // Pacing mode (fps_pace): grid = old ceil-quantized absolute grid
-        // (beats with DWM composition sync -> the 80 fps measurement), rel =
-        // relative pacer with overrun reset, pi = rel + PI wait trim.
         string paceMode = Cfg.FpsPace;
         double capMs = capFrame.TotalMilliseconds;
         double nextDueMs = sw.Elapsed.TotalMilliseconds;
@@ -107,8 +87,8 @@ internal partial class Program
             : Program.DiagMode > 0 ? 6.0 : double.PositiveInfinity;
         long frames = 0;
 
-        // Real-fps sampling: logs every ~2s how many frames each window
-        // actually handed to DWM (post gating) - the number the user sees.
+        // Real-fps sampling: every ~2s log how many frames each window
+        // actually handed to DWM (post gating).
         double fpsLogT = 0;
         long fpsLogFrames = 0;
         var fpsLogPresents = new long[windows.Count];
@@ -147,18 +127,9 @@ internal partial class Program
             preMsSum += f0 - pre0;
             foreach (var w in windows)
                 w.Render(t);
-            // Canvas runs: presents happen AFTER all draws - flips queued last
-            // keep draw commands from stalling behind flip retirement in the
-            // GPU command queue. Preview presents here too; diag 1-6 modes present inside Render().
-            // NOTE: per-frame presents serialize at vblank granularity on one
-            // device - the second Present per frame costs ~1 primary-vblank
-            // (~5.9ms here), which caps the loop below the fastest refresh.
-            // Fixing that needs per-monitor present threads (measured, see
-            // fps investigation logs).
-            // Present phase: canvas runs AND preview present here, after all windows
-            // have drawn (the draw phase never presents itself). Diag 1-6 render modes
-            // present inside Render(); for them this is a no-op because Present()
-            // skips when CanvasDraw did not set _canvasWillPresent.
+            // Present phase: canvas runs AND preview present here, AFTER all
+            // windows have drawn - nothing sits behind a flip in the GPU queue.
+            // Diag 1-6 present inside Render(); Present() no-ops for them.
             foreach (var w in windows)
                 w.Present(t);
             double rMs = sw.Elapsed.TotalMilliseconds - f0;
@@ -171,9 +142,7 @@ internal partial class Program
             if (frames == 1) Log.W("First frame rendered");
             if (frames % 600 == 0) Log.W($"Heartbeat: {frames} frames, t={t:F1}s");
 
-            // Every ~2s: real per-window present fps (post gating) + where the
-            // frame budget went (render ms incl. presents, wait ms, present
-            // call durations) - localizes any bottleneck immediately.
+            // Every ~2s: per-window present fps + where the frame budget went.
             if (canvasMode && t - fpsLogT >= 2.0)
             {
                 double dt = t - fpsLogT;
@@ -216,11 +185,9 @@ internal partial class Program
             {
                 if (paceMode == "grid")
                 {
-                    // Old absolute-grid pacing (fps_pace=grid, for A/B): each
-                    // frame waits for the next ceil-quantized grid slot. When
-                    // per-frame work sits just under one slot, phase jitter
-                    // pushes half the frames into the NEXT slot -> measured
-                    // ~80 fps with a 120 cap. Kept for comparison only.
+                    // Old absolute-grid pacing (kept for A/B comparison): waits
+                    // for the next ceil-quantized grid slot; phase jitter can
+                    // push frames into the next slot (measured ~80 fps @ 120 cap).
                     var elapsed = sw.Elapsed;
                     var nextFrame = TimeSpan.FromTicks((long) Math.Ceiling(elapsed.Ticks / (double) capFrame.Ticks) * capFrame.Ticks);
                     var remain = nextFrame - elapsed;
@@ -237,27 +204,16 @@ internal partial class Program
                 }
                 else
                 {
-                    // Relative pacer (fps_pace=rel/pi): the next frame is due
-                    // exactly one cap interval after the previous one, not at
-                    // the next grid boundary - no aliasing with the DWM
-                    // composition phase. Overrun-safe: when we fall more than
-                    // one slot behind (GC pause, DWM hiccup), reset instead
-                    // of bursting to catch up.
+                    // Relative pacer (rel/pi): next frame due exactly one cap
+                    // interval after the previous - no grid aliasing. Overrun
+                    // reset: never burst to catch up after a stall.
                     nextDueMs += capMs;
-                    // Overrun reset: when work exceeded the budget (we are
-                    // behind the due time), do NOT insert an extra wait -
-                    // start the next frame immediately and re-anchor there.
-                    // (Waiting nextDueMs = now + capMs after every spike
-                    // would add a whole cap slot per overrun.)
                     if (nowMs - nextDueMs > 0) nextDueMs = nowMs;
                     double remainMs = nextDueMs - nowMs;
                     if (paceMode == "pi")
                     {
-                        // PI trim (fps_pace=pi): proportional + integral
-                        // correction of the wait from the measured frame
-                        // interval error. With clean work the rel pacer
-                        // already lands exactly on target (err ~ 0); the
-                        // trim only acts when work jitters around the budget.
+                        // PI trim: proportional + integral correction of the
+                        // wait from the measured frame-interval error.
                         double err = lastIntervalMs - capMs; // + = too slow
                         piInteg = Math.Clamp(piInteg + err, -capMs, capMs);
                         double corr = Math.Clamp(0.30 * err + 0.15 * piInteg, -1.5, 1.5);
@@ -295,7 +251,6 @@ internal partial class Program
             if (waitMs > waitMsMax) waitMsMax = waitMs;
         }
 
-        // Stop present threads before closing windows.
         foreach (var w in windows)
             w.ShutdownPresentThread(500);
 

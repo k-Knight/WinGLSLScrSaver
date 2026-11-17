@@ -1,9 +1,7 @@
 namespace WinGLSLScrSaver;
 
-// Partial of RenderWindow: the shared-canvas draw/present path (CanvasDraw, Present, PresentCore,
-// UpdateFpsLabel, EnsureRawTarget, EnsureLaneTarget).
-// Split from RenderWindow.cs for maintainability - same class, zero
-// behavior change. Core lifecycle, fields and Render() live in RenderWindow.cs.
+// Partial of RenderWindow: shared-canvas draw/present path (CanvasDraw,
+// Present, PresentCore, UpdateFpsLabel, EnsureRawTarget, EnsureLaneTarget).
 
 using System.Diagnostics;
 using System.Numerics;
@@ -34,16 +32,10 @@ internal partial class RenderWindow
         }
     }
 
-    // One normal-run frame, DRAW phase (all windows call this first, then
-    // RunLoop calls Present() on all of them): Pass A (owner only) renders
-    // the shader into the shared canvas ONCE PER LOOP TICK; Pass B blits
-    // each window's crop-to-fit slice - gated to that monitor's own refresh
-    // rate. Canvas iResolution = canvas size (master x mult). NO present
-    // happens here: flips cannot retire before a vblank, and any GPU work
-    // queued behind a flip would stall for up to a whole vblank (measured:
-    // the raw blit queued behind the owner's flip cost a constant ~5.9ms
-    // per frame). Drawing everything first keeps the GPU queue flip-free
-    // until the present phase.
+    // One normal-run frame, DRAW phase (presents happen later, after every
+    // window has drawn - nothing sits behind a flip in the GPU queue, which
+    // would stall up to a whole vblank). Pass B blits are gated to this
+    // monitor's own refresh rate.
     private bool _canvasWillPresent;
 
     private void CanvasDraw(float time)
@@ -54,9 +46,8 @@ internal partial class RenderWindow
 
         if (IsCanvasOwner && _device != null)
         {
-            // Pass A: the shader renders ONCE PER LOOP TICK (not once per
-            // present), so a slower monitor always blits a fresh canvas even
-            // on ticks where this window itself is not due to present.
+            // Pass A: shader renders ONCE PER LOOP TICK (not per present), so
+            // a slower monitor always blits a fresh canvas.
             CanvasBlit.BeginFrame();
             _device.SetFramebuffer(_fb);
             _device.Viewport = new Rectangle(0, 0, _rtW, _rtH);
@@ -71,11 +62,8 @@ internal partial class RenderWindow
             _device.DrawIndexed(6u);
         }
 
-        // Pass B gating (Option A): draw (and later present) only when this
-        // monitor is due by its OWN refresh rate. Undue monitors keep showing
-        // their previous frame - exactly what a native per-monitor vsync loop
-        // does - so a 60 Hz portrait can never throttle a 170 Hz landscape
-        // (and vice versa). Pass A above has already refreshed the canvas.
+        // Pass B gating: draw/present only when this monitor is due by its
+        // own refresh rate - mixed-refresh setups never run at the slowest rate.
         if (PresentGating && time < _nextPresentDue)
         {
             UpdateFpsLabel(time);
@@ -86,11 +74,9 @@ internal partial class RenderWindow
 
         if (IsCanvasOwner && _device != null)
         {
-            // Pass B: this window's slice blit - done through Pie itself
-            // (framebuffer null = Pie's own current backbuffer), so Pie keeps
-            // handling buffer rotation and resize. Never cache an RTV over
-            // the swapchain: the backbuffer is recreated on resize and the
-            // first version of this blit distorted exactly that way.
+            // Pass B: this window's slice blit through Pie itself (framebuffer
+            // null = Pie's own backbuffer). Never cache an RTV over the
+            // swapchain - the backbuffer is recreated on resize.
             _device.SetFramebuffer(null);
             _device.Viewport = new Rectangle(0, 0, w, h);
             _device.SetShader(_blitShader);
@@ -108,9 +94,8 @@ internal partial class RenderWindow
         if (UseLane)
         {
             // Lane path: device1 only copies the canvas into the shared
-            // keyed-mutex texture (once per tick, ordered after the owner's
-            // pass A). This window's blit + present happen on the present
-            // thread on the lane device - fully parallel to device1.
+            // keyed-mutex texture; blit + present run on the present thread
+            // on the lane device - fully parallel.
             EnsureLaneTarget();
             if (_laneSwap != null)
             {
@@ -121,11 +106,8 @@ internal partial class RenderWindow
         }
 
         EnsureRawTarget();
-        // Frame-latency wait (DXGI 1.3): the documented place to wait is the
-        // start of the frame, BEFORE drawing into the back buffer. When the
-        // present queue has room this returns instantly; only a genuinely
-        // full queue (3 queued presents) makes us wait here - explicitly,
-        // measurably, instead of hidden inside Present.
+        // Frame-latency wait (DXGI 1.3 model): wait BEFORE drawing into the
+        // back buffer. ~0ms normally; only a full queue makes us wait here.
         if (_frameLatencyWaitable != IntPtr.Zero)
         {
             long w0 = Stopwatch.GetTimestamp();
@@ -138,11 +120,9 @@ internal partial class RenderWindow
         CanvasBlit.Draw(this);
     }
 
-    // One normal-run frame, PRESENT phase (after ALL windows have drawn):
-    // queues this window's flip - no draw commands follow it in the GPU
-    // queue, so nothing stalls behind flip retirement. With
-    // present_threads=1 the non-owner path hands the flip to this window's
-    // present thread instead of blocking the loop here.
+    // One normal-run frame, PRESENT phase (after ALL windows have drawn).
+    // With present_threads=1 the non-owner path hands the flip to this
+    // window's present thread instead of blocking the loop here.
     public void Present(float time)
     {
         if (_disposed || !_canvasWillPresent) return;
@@ -176,16 +156,12 @@ internal partial class RenderWindow
         }
 
         // DO_NOT_WAIT (never stall the loop): a not-ready swapchain returns
-        // WAS_STILL_DRAWING and the frame is skipped. Default mode is 3
-        // (DO_NOT_WAIT only) - never tears. Modes 1/2 add ALLOW_TEARING:
-        // with SyncInterval 0 the flip lands straight on scanout, mid-frame,
-        // which visibly tears on non-primary monitors (that was wanted only
-        // for the fps_cap investigation). Note: the show_fps label masks
-        // tearing on modes 1/2 - its child window over the flip swapchain
-        // forces DWM-composed, vblank-synced presentation.
-        // Blt-model swapchains support neither flag: ALLOW_TEARING errors out
-        // (INVALID_CALL) every present, and windowed blt cannot tear anyway -
-        // present with flags=0 there.
+        // WAS_STILL_DRAWING and the frame is skipped. Default mode 3 never
+        // tears; modes 1/2 add ALLOW_TEARING (with SyncInterval 0 they tear
+        // visibly on non-primary monitors). The fps label or tear-fix child
+        // window over the flip swapchain forces DWM-composed presentation,
+        // which masks that tearing. Blt-model swapchains support neither
+        // flag - present with flags=0 there (windowed blt cannot tear).
         int presentFlags = !RawBlt && PresentGating ? RawPresentFlagMode switch
         {
             1 => DXGI_PRESENT_ALLOW_TEARING,
@@ -196,18 +172,14 @@ internal partial class RenderWindow
 
         // Mark the swapchain busy for the main thread (Draw / resize must
         // not touch it concurrently - see _presentInFlight).
-        // Covers LaneDraw's GetBuffer AND the Present call itself.
         _presentInFlight = true;
         try
         {
             DXGI.IDXGISwapChain1 swap;
             if (_laneSwap != null)
             {
-                // Lane present: the waitable wait + the shared-canvas blit run on
-                // the LANE device context, which this present thread exclusively
-                // owns. LaneDraw returns false when the device1 side still holds
-                // the keyed mutex - skip this tick (lane shows the previous
-                // canvas copy for one frame).
+                // Lane present: LaneDraw returns false when device1 still
+                // holds the keyed mutex - skip this tick (one stale frame).
                 if (_laneWaitable != IntPtr.Zero)
                     Native.WaitForSingleObject(_laneWaitable, 1000);
                 if (!CanvasBlit.LaneDraw(this))
@@ -244,8 +216,7 @@ internal partial class RenderWindow
     }
 
     // show_fps=1 overlay: creates the label on first use, then updates it at
-    // most every 0.5s. The number counts real presents (PresentFrames), so it
-    // reflects what the monitor is shown, including gating skips.
+    // most every 0.5s. Counts real presents (PresentFrames).
     // tear_fix_child=1 with show_fps off: instead of the label, create the
     // invisible child window once (same DWM-composition tearing fix).
     private void UpdateFpsLabel(double time)
@@ -263,8 +234,8 @@ internal partial class RenderWindow
                 Controls.Add(child);
                 child.BringToFront();
                 // Layered + hit-test transparent + alpha 0 = fully invisible,
-                // while remaining a real child HWND that clips the swapchain
-                // (layered child windows need Win8+; the saver targets Win11).
+                // while remaining a child HWND that clips the swapchain
+                // (layered child windows need Win8+).
                 IntPtr h = child.Handle;
                 int ex = (int) Native.GetWindowLong(h, Native.GWL_EXSTYLE);
                 Native.SetWindowLong(h, Native.GWL_EXSTYLE,
@@ -303,17 +274,15 @@ internal partial class RenderWindow
     }
 
     // Raw-window swapchain + slice VB management (lazy, after the window
-    // settles). The owner has no raw target at all - it blits through Pie.
-    // RawSwapBlt experiment: 1 = blt model with 2 buffers, 2 = blt model with
-    // 1 buffer; 0 = flip model (default). Stored once - ResizeBuffers must
-    // repeat the same effect/count/flags as creation.
+    // settles). RawSwapBlt: 0 = flip model (default), 1 = blt 2 buffers,
+    // 2 = blt 1 buffer. Stored once - ResizeBuffers must repeat the same
+    // effect/count/flags as creation.
     internal bool RawBlt;
     internal int RawBltBuffers;
 
     // Waits up to timeoutMs for the present thread to leave this window's
-    // swapchain (Present / GetBuffer in flight). Returns true when STILL
-    // busy - the caller must skip this tick (one stale frame) instead of
-    // touching the swapchain concurrently (driver-level undefined behavior).
+    // swapchain. Returns true when STILL busy - the caller must skip this
+    // tick instead of touching the swapchain concurrently (UB).
     internal bool WaitForPresentIdle(int timeoutMs)
     {
         var swIdle = System.Diagnostics.Stopwatch.StartNew();
@@ -339,8 +308,7 @@ internal partial class RenderWindow
             Log.W($"Raw swapchain created ({(RawBlt ? $"blt, {RawBltBuffers} buffers" : $"flip, {Program.Cfg.SwapBuffers} buffers, latency {Program.Cfg.MaxLatency}")}, waitable={(_frameLatencyWaitable != IntPtr.Zero)}): {w}x{h}");
             if (_frameLatencyWaitable != IntPtr.Zero)
             {
-                // Microsoft's latency model: take one initial wait after
-                // creation so the first frame starts from a signaled state.
+                // Initial wait so the first frame starts from a signaled state.
                 Native.WaitForSingleObject(_frameLatencyWaitable, 1000);
             }
         }
@@ -349,8 +317,6 @@ internal partial class RenderWindow
             // Never ResizeBuffers while the present thread is inside Present
             // (1-in-5 AV): wait, and if still busy, retry on the next frame.
             if (WaitForPresentIdle(50)) return; // still busy - retry next frame
-            // No cached RTVs to release: the per-frame RTV fetch in Draw stops
-            // touching the buffers during the resize, which ResizeBuffers needs.
             // ResizeBuffers MUST repeat the creation flags and buffer count.
             _rawSwap.ResizeBuffers(RawBlt ? RawBltBuffers : Program.Cfg.SwapBuffers, w, h,
                 DXGI.Format.B8G8R8A8_UNorm,
@@ -367,7 +333,7 @@ internal partial class RenderWindow
 
     // Lane-window equivalent of EnsureRawTarget: a swapchain on the LANE
     // device (device2) plus this window's slice vertex buffer there. The
-    // shared canvas texture itself is created once by CanvasBlit.EnsureLaneDevice.
+    // shared canvas texture is created once by CanvasBlit.EnsureLaneDevice.
     private void EnsureLaneTarget()
     {
         int w = ClientSize.Width, h = ClientSize.Height;
@@ -377,15 +343,10 @@ internal partial class RenderWindow
         {
             if (!CanvasBlit.EnsureLaneDevice(this))
             {
-                // Lane device failed to initialize (logged in CanvasBlit):
-                // disable lane use AND the present thread. This driver AVs
-                // (c0000005, measured 9/10 launches in the stress harness)
-                // when a second thread Presents a swapchain while the main
-                // thread drives the same device's immediate context - the
-                // documented design ("present threads are NOT used on the
-                // same-device fallback"), now actually enforced. The main
-                // thread presents this window's raw swapchain itself
-                // (sequential on one thread - safe).
+                // Lane init failed: disable lane AND present thread - two
+                // threads presenting one device's swapchains AVs (measured
+                // 9/10 launches in the stress harness). Main thread presents
+                // the raw swapchain itself (sequential, safe).
                 UseLane = false;
                 UsePresentThread = false;
                 ShutdownPresentThread(200);
@@ -421,9 +382,7 @@ internal partial class RenderWindow
 
     // Maps this screen's share of the shared canvas: the canvas (master size)
     // is scaled uniformly to COVER the group bbox (centered, overflow
-    // cropped) and the screen samples the canvas window it shows. Returns a
-    // static quad whose vertices place the visible intersection on screen
-    // (TR, BR, BL, TL - CW winding, no vertical flip).
+    // cropped) and the screen samples the canvas window it shows.
     private VPosUv[] ComputeCanvasVerts()
     {
         float w = ClientSize.Width, h = ClientSize.Height;
@@ -464,12 +423,9 @@ internal partial class RenderWindow
         };
     }
 
-
-    // Builds the blit quad vertices for the current client size and letterbox
-    // layout. Winding MUST be clockwise (D3D11 default rasterizer treats CW as
-    // front and culls the rest). Vertex order mirrors the proven fullscreen
-    // quad in ShaderRunner: TR, BR, BL, TL. Top of the quad samples v0 (top
-    // row of the RT) - no vertical flip. Clip space has +Y up (D3D11).
+    // Blit quad vertices for the current client size and letterbox layout.
+    // Winding MUST be clockwise (D3D11 default rasterizer front face); top of
+    // the quad samples v0 (top of the RT) - no vertical flip. Clip space +Y up.
     private VPosUv[] ComputeBlitVerts()
     {
         float w = ClientSize.Width, h = ClientSize.Height;

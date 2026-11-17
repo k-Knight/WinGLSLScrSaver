@@ -54,9 +54,8 @@ internal static class Native
     [DllImport("user32.dll")] internal static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
     [DllImport("user32.dll")] internal static extern bool IsWindow(IntPtr hwnd);
 
-    // Display power management: while the screensaver runs, tell Windows the
-    // display is in use so the OS power plan cannot blank a monitor mid-run
-    // (user report: a monitor occasionally switched off and back on).
+    // Display power management: while the screensaver runs, keep the OS from
+    // blanking a monitor mid-run.
     internal const uint ES_CONTINUOUS = 0x80000000;
     internal const uint ES_DISPLAY_REQUIRED = 0x00000002;
 
@@ -77,9 +76,8 @@ internal static class Native
     internal const int GWL_EXSTYLE = -20;
     internal const int WS_CHILD = 0x40000000;
     internal const int WS_VISIBLE = 0x10000000;
-    // Layered child-window support (Win8+): a fully transparent child window
-    // still counts as a child HWND clipping the parent's flip swapchain, so
-    // DWM must compose - that is the tearing fix without the fps label.
+    // A fully transparent layered CHILD window still clips the parent's flip
+    // swapchain, forcing DWM composition - the tearing fix without the fps label.
     internal const int WS_EX_LAYERED = 0x00080000;
     internal const int WS_EX_TRANSPARENT = 0x00000020; // hit-test pass-through
     internal const uint LWA_ALPHA = 0x2;
@@ -94,11 +92,9 @@ internal static class Native
         => IntPtr.Size == 8 ? SetWindowLongPtr64(hwnd, index, value) : (IntPtr)SetWindowLong32(hwnd, index, (int)value);
 
     // ---- high-resolution waitable timer (FPS pacing) ----
-    // Sleep(1) granularity depends on the system timer resolution, which
-    // since Windows 10 2004 is only raised for the FOCUSED process - a
-    // screensaver never has focus, so Sleep-based pacing degrades to
-    // ~15.6ms ticks. A HIGH_RESOLUTION waitable timer keeps ~0.5ms
-    // precision regardless of focus (Windows 10 1803+).
+    // Sleep(1) is unreliable for a screensaver (timer resolution is only
+    // raised for the FOCUSED process); a HIGH_RESOLUTION waitable timer
+    // keeps ~0.5ms precision regardless (Win10 1803+).
     private const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
 
     [DllImport("kernel32.dll", SetLastError = true)]

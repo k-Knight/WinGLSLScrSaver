@@ -1,18 +1,5 @@
-// ===========================================================================
-// WinGLSLScrSaver - a GLSL shader screensaver for Windows (.scr)
-// ---------------------------------------------------------------------------
-// Renders a GLSL fragment shader on the GPU (Direct3D 11 via Pie) as a real
-// Windows screensaver with full /s /p /c support. A random shader is drawn
-// from the configured folder on every start.
-//
-// DEBUG BUILD NOTES:
-//   * DEBUG builds and --diag runs log to %localappdata%\WinGLSLScrSaver\
-//     (falls back to %TEMP%). Release builds are silent: no log file,
-//     zero per-call file I/O.
-//   * GPU device creation is deferred until AFTER the form is shown and
-//     (for preview) reparented - WinForms recreates window handles when
-//     properties change, which would orphan a device created too early.
-// ===========================================================================
+// WinGLSLScrSaver - GLSL shader screensaver for Windows (.scr).
+// Renders a GLSL fragment shader on the GPU (D3D11 via Pie) with /s /p /c support.
 namespace WinGLSLScrSaver;
 
 using System.Text.RegularExpressions;
@@ -25,13 +12,9 @@ internal partial class Program
     // Loaded once at startup; the /c dialog edits and saves this object.
     internal static AppSettings Cfg;
 
-    // --diag=1: gradient to backbuffer (blit path)   --diag=2: solid red into
-    // RT, blitted normally (RT path)   --diag=3: full pipeline + frame logs.
-    // --diag=4: gradient + pixel readback.
     internal static int DiagMode = 0;
 
-    // The shared-canvas pipeline: normal runs plus the diag-7 verbose
-    // variant. One named test instead of a repeated DiagMode pattern.
+    // Shared-canvas pipeline: normal runs plus diag-7 (verbose logging only).
     internal static bool CanvasPipeline => DiagMode is 0 or 7;
 
     [STAThread]
@@ -40,9 +23,6 @@ internal partial class Program
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
             Log.Ex("UnhandledException", (Exception) e.ExceptionObject);
 
-        // NOTE: never interpolate Log.Path into a W() call unconditionally -
-        // the argument is evaluated even when logging is off, which used to
-        // create an empty log file next to the exe in Release.
         Log.W("=================================================");
         Log.W($"WinGLSLScrSaver starting. args=[{string.Join(" ", args)}]");
         if (Log.Verbose) Log.W($"Log file: {Log.Path}");
@@ -81,20 +61,17 @@ internal partial class Program
                 mode = "c";
         }
         if (mode.Length == 0) mode = "c";
-        // A preview hwnd in the args means preview mode, period: never let a
-        // stray /s token (shell verb, wrapper script) escalate this run into
-        // the fullscreen multi-monitor path.
+        // A preview hwnd in the args means preview mode, period.
         if (previewHwnd != IntPtr.Zero) mode = "p";
         Log.W($"mode={mode} previewHwnd=0x{previewHwnd.ToInt64():X}");
 
-        // Optional diagnostic flag: --diag=N or /diag:N
         foreach (string a in args)
         {
             Match dm = Regex.Match(a, @"(?i)^[/\-]{1,2}diag[:=](\d)$");
             if (dm.Success)
             {
                 DiagMode = dm.Groups[1].Value[0] - '0';
-                Log.Verbose = true; // an explicit diag request re-enables logging even in Release
+                Log.Verbose = true; // diag re-enables logging even in Release
                 Log.W($"DIAG MODE {DiagMode} enabled (auto-exit after 6s)");
             }
         }
@@ -131,17 +108,13 @@ internal partial class Program
     private static void ShowConfig()
     {
         Log.W("Showing config dialog");
-        // ShowDialog (not Application.Run): with a modeless main form the
-        // OK/Cancel buttons never closed the dialog and DialogResult stayed
-        // None, so no config file was ever written. ShowDialog gives the
-        // buttons their normal semantics; saving still happens OnFormClosed.
+        // ShowDialog, not Application.Run - modeless buttons never closed the dialog.
         new ConfigDialog().ShowDialog();
         Log.W("Config dialog closed");
     }
 
-    // Pick this run's shader: a random .fs/.glsl/.frag from the configured
-    // folder (falling back to the local app data dir when not configured or
-    // the folder is gone/empty), else the embedded default.
+    // Random .fs/.glsl/.frag from the configured folder (fallback: app data
+    // dir, then the embedded default).
     private static string LoadShaderText()
     {
         string folder = Cfg.ShaderFolder;
@@ -173,7 +146,6 @@ internal partial class Program
         catch { return Array.Empty<string>(); }
     }
 
-    // ---- shared setup ----
     private static List<RenderWindow> CreateWindows(string shaderText, bool preview, Rectangle previewBounds,
         out string vertexShader, out string fragmentShader)
     {
@@ -238,7 +210,6 @@ void main()
                     new Point(rect.X - group.Bbox.X, rect.Y - group.Bbox.Y),
                     isPreview: false, inputExit: true,
                     resMult: Cfg.ResMult, scaleBlend: Cfg.ScaleBlend);
-                // Per-monitor refresh rate for present gating (Option A).
                 var scr = screens.FirstOrDefault(s => s.Bounds == rect);
                 if (scr != null) win.RefreshHz = GetScreenRefreshHz(scr);
                 Log.W($"  window bounds={rect}: refresh={win.RefreshHz:0.#} Hz");
@@ -274,10 +245,7 @@ void main()
         return best;
     }
 
-    // Effective render-loop FPS cap: 0 (auto) = uncapped pacing at the
-    // fastest display's refresh - exactly today's behavior. Otherwise clamp
-    // to 1..max(highest monitor refresh, 120): above the fastest refresh no
-    // scan-out ever picks the frames up, so there is nothing to gain.
+    // fps_cap 0 (auto) = uncapped; otherwise clamp to 1..max(fastest refresh, 120).
     private static int EffectiveFpsCap(int fastestRefresh)
     {
         int cap = Cfg.FpsCap;
@@ -291,7 +259,7 @@ void main()
         return eff;
     }
 
-    // Shader source strings stashed for RunLoop (created in CreateWindows).
+    // Shader sources for RunLoop (created in CreateWindows).
     internal static string VertexShaderStatic;
     internal static string FragmentShaderStatic;
 
@@ -306,11 +274,8 @@ void main()
             return;
         }
 
-        // Keep the displays on for the whole run: without this, the Windows
-        // power plan can blank a monitor while the screensaver is animating
-        // (reported: second monitor occasionally switched off, then back on).
-        // Note this only prevents OS power management; a real cable/hardware
-        // dropout would still be visible in the Event Viewer diagnostics.
+        // Keep the displays on for the whole run (OS power plan can blank a
+        // monitor mid-run otherwise).
         Native.SetThreadExecutionState(Native.ES_CONTINUOUS | Native.ES_DISPLAY_REQUIRED);
         Log.W("Fullscreen: display keep-awake set (ES_DISPLAY_REQUIRED)");
 
@@ -328,7 +293,7 @@ void main()
         }
         finally
         {
-            Native.SetThreadExecutionState(Native.ES_CONTINUOUS); // clear keep-awake
+            Native.SetThreadExecutionState(Native.ES_CONTINUOUS);
             try { mutex.ReleaseMutex(); } catch { }
         }
     }
@@ -337,9 +302,7 @@ void main()
     private static void RunPreview(IntPtr parentHwnd)
     {
         Log.W($"Preview: parent hwnd=0x{parentHwnd.ToInt64():X}");
-        // Single instance: a preview run and a fullscreen run must never
-        // coexist (two instances fighting over the monitors). Same mutex the
-        // /s path takes; this instance exits if any other is running.
+        // Single instance: preview and fullscreen runs must never coexist.
         using var mutex = new Mutex(true, @"Local\WinGLSLScrSaverRunning", out bool previewMutexNew);
         if (!previewMutexNew)
         {
@@ -369,8 +332,6 @@ void main()
             new IntPtr(Native.WS_CHILD | Native.WS_VISIBLE));
         Log.W($"Preview: SetWindowLong result={styleResult.ToInt64()}");
 
-        // Preview: keep the current default (uncapped vsync pacing).
         RunLoop(windows, GetFastestRefresh(preview: true), 0);
     }
 }
-
