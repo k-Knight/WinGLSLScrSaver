@@ -69,9 +69,26 @@ internal static class Native
     internal static extern IntPtr SetWindowLongPtr64(IntPtr hwnd, int index, IntPtr newLong);
     [DllImport("user32.dll", EntryPoint = "SetWindowLongW")]
     internal static extern int SetWindowLong32(IntPtr hwnd, int index, int newLong);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
+    internal static extern IntPtr GetWindowLongPtr64(IntPtr hwnd, int index);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+    internal static extern int GetWindowLong32(IntPtr hwnd, int index);
     internal const int GWL_STYLE = -16;
+    internal const int GWL_EXSTYLE = -20;
     internal const int WS_CHILD = 0x40000000;
     internal const int WS_VISIBLE = 0x10000000;
+    // Layered child-window support (Win8+): a fully transparent child window
+    // still counts as a child HWND clipping the parent's flip swapchain, so
+    // DWM must compose - that is the tearing fix without the fps label.
+    internal const int WS_EX_LAYERED = 0x00080000;
+    internal const int WS_EX_TRANSPARENT = 0x00000020; // hit-test pass-through
+    internal const uint LWA_ALPHA = 0x2;
+
+    [DllImport("user32.dll")]
+    internal static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint crKey, byte alpha, uint flags);
+
+    internal static IntPtr GetWindowLong(IntPtr hwnd, int index)
+        => IntPtr.Size == 8 ? GetWindowLongPtr64(hwnd, index) : (IntPtr)GetWindowLong32(hwnd, index);
 
     internal static IntPtr SetWindowLong(IntPtr hwnd, int index, IntPtr value)
         => IntPtr.Size == 8 ? SetWindowLongPtr64(hwnd, index, value) : (IntPtr)SetWindowLong32(hwnd, index, (int)value);

@@ -233,6 +233,12 @@ internal partial class RenderWindow : Form
     private long _fpsLabelFrames;
     private double _fpsLabelT;
 
+    // tear_fix_child=1 (with show_fps off): a fully transparent child window
+    // over the flip swapchain - the same DWM-composition hack the fps label
+    // provides (a child HWND over the swapchain forces DWM-composed,
+    // vblank-synced presentation), but invisible: layered child with alpha 0.
+    private Control _tearFixChild;
+
     private static Cursor _hiddenCursor;
 
     private static Cursor HiddenCursor()
@@ -265,6 +271,13 @@ internal partial class RenderWindow : Form
         // surface exposed must be black (white startup flash report).
         BackColor = Color.Black;
         SetStyle(ControlStyles.Opaque | ControlStyles.AllPaintingInWmPaint, true);
+
+        // Hide the cursor on EVERY window, not just the canvas owner: raw
+        // windows 1..N never run InitGraphics, so the cursor stayed visible
+        // on all non-primary monitors. Setting it here (constructor) covers
+        // every init path; child controls (fps label, tear-fix child) inherit
+        // the parent cursor via Control.Cursor, so they stay hidden too.
+        if (!isPreview) Cursor = HiddenCursor();
 
         _master = master;
         _groupBbox = groupBbox;
@@ -406,8 +419,8 @@ void main()
                 Log.W($"InitGraphics: {(Program.CanvasPipeline ? "canvas" : "scaled path")} RT {rtW}x{rtH} (master={_master.Width}x{_master.Height}, mult={_resMult:0.###}, blend={_scaleBlend:0.###})");
             }
 
-            // Hide the cursor only after everything initialized (fullscreen).
-            Cursor = IsPreview ? Cursors.Default : HiddenCursor();
+            // (Cursor hiding moved to the constructor: raw windows 1..N never
+            // reach InitGraphics, so the cursor must be hidden for all of them.)
 
             // Normal runs: this window hosts the shared device - set up the
             // canvas wrap + raw blit that ALL windows (itself included) use.

@@ -30,6 +30,13 @@ internal static class Settings
 //                  monitors. The show_fps label hides the tearing (a child
 //                  window over the flip swapchain forces DWM-composed,
 //                  vblank-synced presentation).
+//   tear_fix_child=0  transparent child-window tearing fix: 1 = when show_fps
+//                  is OFF, create an invisible (layered, alpha=0) child window
+//                  over the flip swapchain - the same DWM-composition hack the
+//                  fps label provides (a child window over the flip swapchain
+//                  forces DWM-composed, vblank-synced presentation) without
+//                  showing anything. No effect while show_fps is on (the fps
+//                  label already does the job).
 //   fps_pace=rel    how the FPS cap paces the loop (only when fps_cap>0 or
 //                  fullscreen canvas runs):
 //                  grid = absolute 120Hz-style grid, ceil-quantized (old
@@ -84,6 +91,7 @@ internal sealed class AppSettings
     public float ResMult = 0.5f;
     public float ScaleBlend = 0.5f;
     public bool ShowFps = true;     // per-window fps overlay
+    public bool TearFixChild;       // invisible child window tearing fix (only used when ShowFps is off)
     public int RawPresentFlags = 3; // see header comment (3 = DO_NOT_WAIT only - ALLOW_TEARING was the fps-test flag; it visibly tears)
     public string FpsPace = "rel";  // grid | rel | pi
     public bool PresentThreads;     // per-window present threads (raw windows)
@@ -136,6 +144,9 @@ internal sealed class AppSettings
                     case "show_fps":
                         s.ShowFps = val is "1" or "true" or "on";
                         break;
+                    case "tear_fix_child":
+                        s.TearFixChild = val is "1" or "true" or "on";
+                        break;
                     case "raw_present_flags":
                         if (int.TryParse(val, out int rpf)) s.RawPresentFlags = rpf;
                         break;
@@ -182,6 +193,7 @@ internal sealed class AppSettings
                 $"res_mult={ResMult.ToString("0.####", CultureInfo.InvariantCulture)}\n" +
                 $"scale_blend={ScaleBlend.ToString("0.####", CultureInfo.InvariantCulture)}\n" +
                 $"show_fps={(ShowFps ? 1 : 0)}\n" +
+                $"tear_fix_child={(TearFixChild ? 1 : 0)}\n" +
                 $"raw_present_flags={RawPresentFlags}\n" +
                 $"fps_pace={FpsPace}\n" +
                 $"present_threads={(PresentThreads ? 1 : 0)}\n" +

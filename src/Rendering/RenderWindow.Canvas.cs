@@ -246,8 +246,37 @@ internal partial class RenderWindow
     // show_fps=1 overlay: creates the label on first use, then updates it at
     // most every 0.5s. The number counts real presents (PresentFrames), so it
     // reflects what the monitor is shown, including gating skips.
+    // tear_fix_child=1 with show_fps off: instead of the label, create the
+    // invisible child window once (same DWM-composition tearing fix).
     private void UpdateFpsLabel(double time)
     {
+        if (_tearFixChild == null && Program.Cfg.TearFixChild && !Program.Cfg.ShowFps && IsHandleCreated)
+        {
+            try
+            {
+                var child = new Control
+                {
+                    Location = new Point(0, 0),
+                    Size = new Size(64, 24),
+                    Enabled = false, // never takes mouse input - input-exit keeps working
+                };
+                Controls.Add(child);
+                child.BringToFront();
+                // Layered + hit-test transparent + alpha 0 = fully invisible,
+                // while remaining a real child HWND that clips the swapchain
+                // (layered child windows need Win8+; the saver targets Win11).
+                IntPtr h = child.Handle;
+                int ex = (int) Native.GetWindowLong(h, Native.GWL_EXSTYLE);
+                Native.SetWindowLong(h, Native.GWL_EXSTYLE,
+                    (IntPtr) (ex | Native.WS_EX_LAYERED | Native.WS_EX_TRANSPARENT));
+                Native.SetLayeredWindowAttributes(h, 0, 0, Native.LWA_ALPHA);
+                _tearFixChild = child;
+                Log.W($"Tear-fix: transparent child window created over the flip swapchain " +
+                      $"(show_fps off, hwnd=0x{h.ToInt64():X})");
+            }
+            catch (Exception ex) { Log.Ex("Tear-fix child window", ex); }
+        }
+
         if (_fpsLabel == null)
         {
             if (!Program.Cfg.ShowFps || !IsHandleCreated) return;

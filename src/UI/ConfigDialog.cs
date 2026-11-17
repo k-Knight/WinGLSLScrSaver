@@ -10,6 +10,7 @@ internal class ConfigDialog : Form
     private readonly TrackBar _scaleBlend;
     private readonly Label _scaleBlendLabel;
     private readonly CheckBox _showFps;
+    private readonly CheckBox _tearFix;
     private readonly ComboBox _fpsPace;
     private readonly CheckBox _presentThreads;
     private readonly ComboBox _presentLanes;
@@ -28,7 +29,7 @@ internal class ConfigDialog : Form
         MinimizeBox = MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         AutoScaleMode = AutoScaleMode.Dpi; // keep fixed-pixel layout intact at 125%/150% display scaling
-        ClientSize = new Size(484, 585);
+        ClientSize = new Size(484, 610);
 
         // ---- row 1: shader folder ----
         var folderLabel = new Label { Text = "Shader folder (a random shader is picked each start):",
@@ -145,11 +146,25 @@ internal class ConfigDialog : Form
             Checked = s.ShowFps,
         };
 
+        // ---- row 6: transparent child-window tearing fix ----
+        var tearFixHelp = NewHelpButton(12, 286,
+            "Create an invisible child window that fixes DWM tearing when the FPS counters are off.",
+            "Transparent child window tearing fix",
+            "The FPS counter label is a child window over the flip-model swapchain, and a child window over the swapchain forces DWM-composed, vblank-synced presentation - which is why tearing disappears while the counter is shown.\n\n" +
+            "With this option, when Show FPS counters is OFF, an invisible (layered, fully transparent) child window is created over each swapchain instead - the same tearing fix, but nothing is visible.\n\n" +
+            "Has no effect while the FPS counters are on (the counter already does the job). config key: tear_fix_child=1.");
+        _tearFix = new CheckBox
+        {
+            Text = "Transparent child window tearing fix (only when FPS counters are off)",
+            Location = new Point(40, 288), AutoSize = true,
+            Checked = s.TearFixChild,
+        };
+
         // ---- advanced group: raw pipeline tuning ----
         var advanced = new GroupBox
         {
             Text = "Advanced render pipeline (leave defaults unless tuning)",
-            Location = new Point(12, 292), Size = new Size(460, 240),
+            Location = new Point(12, 318), Size = new Size(460, 240),
         };
 
         int rowY = 22;
@@ -278,8 +293,8 @@ internal class ConfigDialog : Form
         });
 
         // ---- buttons ----
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(290, 542), Width = 85 };
-        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(382, 542), Width = 85 };
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(290, 568), Width = 85 };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(382, 568), Width = 85 };
 
         Controls.AddRange(new Control[]
         {
@@ -288,6 +303,7 @@ internal class ConfigDialog : Form
             resHelp, resLabel, _resMult, _resMultLabel,
             blendHelp, blendLabel, _scaleBlend, _scaleBlendLabel,
             fpsOverlayHelp, _showFps,
+            tearFixHelp, _tearFix,
             advanced,
             ok, cancel,
         });
@@ -325,6 +341,7 @@ internal class ConfigDialog : Form
             s.ResMult = Math.Clamp(_resMult.Value / 100f, AppSettings.MinResMult, AppSettings.MaxResMult);
             s.ScaleBlend = _scaleBlend.Value / 100f;
             s.ShowFps = _showFps.Checked;
+            s.TearFixChild = _tearFix.Checked;
             s.FpsPace = _fpsPace.SelectedIndex switch { 1 => "grid", 2 => "pi", _ => "rel" };
             s.PresentThreads = _presentThreads.Checked;
             s.PresentLanes = _presentLanes.SelectedIndex + 1;
