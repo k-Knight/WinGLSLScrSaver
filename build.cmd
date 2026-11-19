@@ -28,14 +28,29 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem R2 spec ?7: publish\ contains a single binary plus shader.fs - the exe is
+rem RENAMED to .scr (no duplicated exe wasting space). For command-line
+rem launches from PowerShell either launch from cmd (CreateProcess forwards
+rem argv verbatim to .scr files) or make an exe-named copy on demand:
+rem   copy WinGLSLScrSaver.scr WinGLSLScrSaver.exe
+rem (The scrfile registry template fix - "%1" /S %* - also lets ShellExecute
+rem pass .scr arguments through; see README.)
 del publish\WinGLSLScrSaver.scr >nul 2>nul
 ren publish\WinGLSLScrSaver.exe WinGLSLScrSaver.scr >nul
 del publish\WinGLSLScrSaver.pdb >nul 2>nul
 if exist shaders\shader_techno.fs copy /y shaders\shader_techno.fs publish\shader.fs >nul
 
+rem Scintilla.NET does NOT load its native DLLs (Scintilla.dll / Lexilla.dll)
+rem through the .NET single-file host - its type initializer probes the disk
+rem for an x64\ subfolder next to the app. In a single-file bundle those
+rem files never exist on disk, so we must deploy them beside the .scr or the
+rem editor crashes with TypeInitializationException on startup.
+if not exist publish\x64 mkdir publish\x64
+copy /y bin\Release\net8.0-windows\win-x64\x64\Scintilla.dll publish\x64\ >nul
+copy /y bin\Release\net8.0-windows\win-x64\x64\Lexilla.dll publish\x64\ >nul
+
 echo.
-echo Done. Portable pair in publish\:
-dir publish\WinGLSLScrSaver.scr publish\shader.fs | findstr /i "WinGLSLScrSaver shader.fs"
-echo Copy publish\WinGLSLScrSaver.scr to C:\Windows\System32 (or right-click it and
-echo choose Install) - it runs on any Windows 10/11 x64 PC with nothing else installed.
+echo Done. In publish\: WinGLSLScrSaver.scr (install) + shader.fs + x64\ (Scintilla native)
+echo For CLI use from PowerShell: copy WinGLSLScrSaver.scr WinGLSLScrSaver.exe
+echo or launch the .scr from cmd (argv passes through), e.g. -t file.fs
 endlocal

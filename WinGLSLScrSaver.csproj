@@ -16,6 +16,7 @@
     <PackageReference Include="Pie" Version="0.10.1" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.3.4" />
     <PackageReference Include="Vortice.D3DCompiler" Version="3.3.4" />
+    <PackageReference Include="Scintilla.NET" Version="5.*" />
   </ItemGroup>
 
 </Project>

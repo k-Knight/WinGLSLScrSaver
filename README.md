@@ -1,77 +1,76 @@
 # WinGLSLScrSaver
 
-> **Agents: read `AGENT_HANDOFF.md` (repo root) first** - it documents the
-> FPS/pacing investigation, the present-serialization root cause, the AMD
-> keyed-mutex limitation, past crashes and the test workflow.
+> **Agents: read `AGENT_HANDOFF.md` (repo root) first** - pacing investigation,
+> present-serialization root cause, AMD keyed-mutex limit, crash history, test workflow.
 
-A multi-monitor GLSL screensaver for Windows. Renders shaders with D3D11, written in C# / WinForms.
+A multi-monitor GLSL screensaver for Windows. D3D11 via Pie, C# / WinForms.
 
-Modes: `/s` (run), `/c` (config), `/p` (preview), plus `--diag` modes for troubleshooting.
+## Modes
+
+`/s` run, `/c` config, `/p <hwnd>` preview, `/e [path]` live shader editor, `/t [path]` shader smoke test (100x100 window, ~2 s; exit 0 = pass, 2 = fail; also warms the shader cache), `--diag:N` diagnostics (auto-exits after 6 s), `-h` / `/?` help. Windows style (`/s`, `/p12345`) and unix style (`-s`, `--editor file.fs`) mix freely; a bare existing `.fs`/`.glsl`/`.frag` path opens the editor.
+
+**ShellExecute drops `.scr` arguments**: launching a `.scr` via double-click, `Start-Process` or PowerShell goes through the `HKCR\scrfile\shell\open\command` template `"%1" /S`, which has no placeholder for extra args - flags are silently dropped and it runs fullscreen. Workarounds:
+
+- Launch from **cmd**, which runs it via `CreateProcess` and forwards argv verbatim: `WinGLSLScrSaver.scr -e file.fs`.
+- **Registry fix** (admin): `reg add "HKCR\scrfile\shell\open\command" /ve /d "\"%1\" /S %*" /f` (`fix_screensaver_args.reg` is a ready merge file). Machine-wide; a feature update can reset it.
+- **Exe-named copy**: `copy WinGLSLScrSaver.scr WinGLSLScrSaver.exe`, then `.\WinGLSLScrSaver.exe -e [file]`.
+
+The `.scr` itself is for installing: double-click = run fullscreen, right-click = Install.
 
 ## Technologies
 
-- **C# / .NET 8**: published self-contained as a single `.scr`, so nothing has to be installed on the target machine
-- **WinForms**: the borderless fullscreen windows and the config dialog
-- **Pie** (0.10.1): thin graphics wrapper over D3D11. Shaders are fed in as GLSL source; Pie compiles them with shaderc (GLSL to SPIR-V), cross compiles the SPIR-V to HLSL (SPIRV-Cross) and creates the D3D11 shaders from that
-- **Vortice.Direct3D11 / D3DCompiler**: raw D3D11 used directly for the extra swapchains and the HLSL slice blit of the shared canvas, because Pie 0.10.1 can only create one swapchain per device
-- **Win32 interop** (`Gl\Native.cs`): DPI awareness, monitor refresh rates, cursor hiding, display keep-awake, and the high resolution waitable timer used for FPS capping
+- **C# / .NET 8**, published self-contained as a single `.scr` (nothing to install)
+- **WinForms** for the fullscreen windows and config dialog
+- **Scintilla.NET** 5: the editor's code control (native styling, never scrolls on recolor)
+- **Pie** 0.10.1: D3D11 wrapper; compiles GLSL with shaderc, cross-compiles SPIR-V to HLSL
+- **Vortice.Direct3D11 / D3DCompiler**: raw D3D11 for the extra swapchains and the blit (Pie can only create one swapchain per device)
+- **Win32 interop** (`Gl\Native.cs`): DPI awareness, refresh rates, cursor hiding, keep-awake, high-res waitable timer
 
 ## Architecture
 
-One process, one shared canvas. `/s` first computes groups from the connected screens: screens that tile a rectangle nearly perfectly (within 1% of the smaller screen's size, absorbing driver coordinate rounding and bezel compensation) merge into one group and are treated as a single monitor. One borderless top-most `RenderWindow` is created per group.
+Screens that tile a rectangle nearly perfectly (1% tolerance absorbs driver rounding and bezel compensation) merge into one group; one borderless top-most `RenderWindow` per group. Window 0 hosts the single Pie D3D11 device and the shared canvas: a render target at master resolution (max width/height over all groups) times `res_mult`. Every other window is a raw flip-model DXGI swapchain on that same device (separate devices cannot share textures).
 
-The first window hosts the one Pie D3D11 device for the whole process and owns the shared canvas: a render target sized to the master resolution (max width and max height over all groups) times `res_mult`. Every other window is a raw window: a plain flip-model DXGI swapchain (2+ buffers, `AllowTearing`) created directly on that same device. Separate devices cannot share textures, which is why everything runs on one.
+## Present pacing
 
-## Per-monitor present pacing
+The loop never blocks on a vblank. Each tick: **draw** - the owner renders the shader into the shared canvas once, every due window blits its slice, nobody presents yet (GPU work queued behind a flip would stall up to a whole vblank); then **present** - every window that drew queues `Present(0, DO_NOT_WAIT | ALLOW_TEARING)`. Each window paces itself to its own monitor's refresh, so a 60 Hz portrait never throttles a 170 Hz landscape. The loop runs on the high-res waitable timer (immune to the 15.6 ms unfocused-process sleep degradation) at the fastest refresh, or `fps_cap`.
 
-The loop never blocks on any monitor's vblank. Each frame is split into a draw phase and a present phase:
+Known limit: presents from one device serialize at vblank granularity (~one primary-vblank per extra `Present`), so multi-monitor runs stay below the fastest refresh. Fixing that needs per-monitor present threads (present-lanes exist as an experiment, see `present_lanes`).
 
-1. **Draw phase**: the owner renders the shader into the shared canvas once, then every window whose monitor is *due* blits its slice. No present happens yet - a flip cannot retire before a vblank, and any GPU work queued behind a flip would stall for up to a whole vblank (measured at ~5.9 ms per frame).
-2. **Present phase**: every window that drew now queues its flip with `Present(0, DO_NOT_WAIT | ALLOW_TEARING)` - never blocking the loop.
+## Shader editor (`/e`)
 
-Each window paces itself to its own monitor's refresh rate (`EnumDisplaySettings`): a monitor that is not due yet simply keeps showing its previous frame, exactly like a native per-monitor vsync loop - so a 60 Hz portrait can never throttle a 170 Hz landscape and vice versa. The loop itself is paced by the high resolution waitable timer (immune to the 15.6 ms sleep degradation of unfocused processes) at the fastest monitor's refresh, or at `fps_cap` when set.
+Dark Scintilla editor with GLSL highlighting, line-number gutter and an embedded live preview (resizable splitter - the preview re-renders at the new size, never stretched). Status bar under the viewer: compile state + resolved textures, file path, Ln/Col. Window position/size and the splitter ratio persist across sessions (per-monitor DPI aware). Toolbar: Open Ctrl+O, Save Ctrl+S, Save As, Reload, Apply F5, Insert texture example. Edits recompile ~800 ms after the last keystroke; the preview keeps running the previous shader until the new one compiles; errors show in the status bar (double-click jumps to the line). Ctrl+S saves (Ctrl+S on an unsaved default opens Save As), redirects texture lookup to the file's folder and invalidates the shader cache.
 
-Known limit: presents from one D3D11 device serialize at vblank granularity - the second (and further) `Present` of a frame costs about one primary-vblank period, so with several monitors the loop runs below the fastest refresh even though no single monitor is the bottleneck. Removing that limit needs per-monitor present threads (draws stay on the main thread; only the flip queueing moves).
+External changes are watched: the file reloads automatically with scroll, selection and caret preserved; the editor's own saves never trigger a reload; unsaved edits are kept and reported. A save that does not change the source or path skips the recompile. Compiles run off the UI thread; the vsync flip runs on a present thread; resizes are applied on the UI thread only when the present thread is idle. UI-thread exceptions are logged (WinForms would otherwise exit silently).
 
 ## Shader handling
 
-`Gl\ShaderAdapter.cs` adapts user GLSL before Pie sees it. It strips `#version`, `iResolution` / `iTime` uniforms and output declarations, then wraps the code in a header that declares those uniforms as a single UBO (`vec4 uResolutionTime`: xyz = resolution, w = time in seconds) plus the vertex input and fragment output. Shadertoy style shaders (a `mainImage` function, no `main`) get a `main` generated around them. If no shader file is found, an embedded default swirl shader is used.
+`Gl\ShaderAdapter.cs` strips `#version`, `iResolution` / `iTime`, `sampler2D` and output declarations, then wraps the code in a header declaring them as a single UBO (`vec4 uResolutionTime`: xyz = resolution, w = seconds) plus vertex input / fragment output. Shadertoy-style shaders (`mainImage`, no `main`) get a `main` generated; `iChannel0..3` are auto-declared, so pasted Shadertoy code works unchanged. No file found -> embedded default swirl shader.
 
-## Render pipeline (normal runs)
+**Shader cache** (on by default): the adapted fragment is compiled to SPIR-V once and cached in `%localappdata%\WinGLSLScrSaver\cache\`, keyed on the file's mtime + length; an untouched file never re-runs shaderc (Pie's SPIRV-Cross -> HLSL step still runs - not cacheable through its API). Any edit invalidates the entry; the editor never touches the cache; `shader_cache=0` opts out. A corrupt entry falls back to a full compile.
 
-1. **Pass A, once per loop tick**: the shader renders into the shared canvas. The shader sees the canvas resolution (master x `res_mult`) as `iResolution`.
-2. **Pass B, per due window**: a crop-to-fit blit of that window's slice. The canvas is scaled uniformly to cover the group's area (centered, overflow cropped, never stretched or letterboxed) and the window samples the part of the canvas it shows. The owner blits through Pie itself (framebuffer null, so Pie handles backbuffer rotation and resize); raw windows use the raw HLSL blit in `CanvasBlit.cs`, which samples the canvas twice (bilinear + nearest) and mixes the two samples by `scale_blend`. That factor is baked into the blit shader source at startup as a GLSL float literal (which must always carry a decimal point). Raw flip-model backbuffers have no stable RTV: `GetBuffer(0)` always returns the *current* back buffer in D3D11, so the RTV is re-created per frame.
-3. **Present phase, per due window**: `Present(0, DO_NOT_WAIT | ALLOW_TEARING)` - non-blocking, per-monitor cadence.
+**Textures:** `uniform sampler2D name;` + `name.png` next to the shader (then shader folder, then app data dir), decoded flipped, bound at slots 1..N (0 = the UBO). Missing PNGs sample as black. See `shaders\matrix_atlas.fs` for a full example.
 
-So the shader runs once per loop tick no matter how many monitors there are, and `res_mult` is paid once instead of once per monitor. Diag modes 1 to 6 bypass this pipeline and use their own per-window paths; diag 7 runs the same pipeline and only turns verbose logging on.
+## Render pipeline
 
-One Pie quirk worth knowing: in 0.10.1, `UpdateBuffer` on a dynamic vertex buffer silently fails, so all vertex buffers here are created static.
+1. **Pass A, per tick**: shader renders into the shared canvas (`iResolution` = canvas size).
+2. **Pass B, per due window**: crop-to-fit blit of its slice - canvas scaled uniformly to cover the group (centered, cropped, never stretched). The owner blits through Pie; raw windows use the raw HLSL blit in `CanvasBlit.cs` (bilinear + nearest samples mixed by `scale_blend`, baked into the shader source).
+3. **Present phase, per due window**: non-blocking, per-monitor cadence.
+
+The shader runs once per tick regardless of monitor count; `res_mult` is paid once. Diag modes 1-6 bypass this pipeline; diag 7 only turns on verbose logging.
+
+Pie quirks worth knowing: `UpdateBuffer` on dynamic vertex buffers silently fails in 0.10.1 (all VBs are static); flip-model backbuffers have no stable RTV (`GetBuffer(0)` is always the *current* back buffer - RTV re-created per frame); `Debug=true` throws `SEHException` on `SetDepthStencilState`.
 
 ## Shaders
 
-On every start one shader is picked at random:
-
-1. a random `.fs`, `.glsl` or `.frag` file from the folder set in `/c`
-2. otherwise a random shader from `%localappdata%\WinGLSLScrSaver\`
-3. otherwise an embedded default swirl shader
+One shader picked at random at start: a random `.fs`/`.glsl`/`.frag` from the configured folder, else from `%localappdata%\WinGLSLScrSaver\`, else the embedded default.
 
 ## Settings (`/c`)
 
-All settings are stored in `%localappdata%\WinGLSLScrSaver\config.txt` as `key=value` lines. A config file that only holds a folder path (the old format) still works.
-
-- `folder`: where shaders are picked from
-- `fps_cap`: `0` = auto (pace at the fastest monitor's refresh). When set, the loop runs at that rate (clamped to 1..max screen refresh, 120)
-- `res_mult`: 0.05 to 1.0. Scales the shared canvas; the crop-to-fit blits stay at full screen resolution
-- `scale_blend`: 0 = nearest, 1 = bilinear, values in between mix both
-- `show_fps`: `1` shows a small counter on each monitor. It counts frames actually handed to the display (post pacing) - not render ticks
+`%localappdata%\WinGLSLScrSaver\config.txt`, `key=value` lines (a bare folder path - the old format - still works): `folder`, `fps_cap` (0 = auto = fastest refresh), `res_mult` (0.05-1.0, scales the canvas), `scale_blend` (0 = nearest, 1 = bilinear), `show_fps`, `shader_cache`, plus tuning keys documented in the header comment of `src\Core\Settings.cs`.
 
 ## Logs
 
-Only DEBUG builds and `--diag` runs write anything; Release is fully silent.
-
-- `%localappdata%\WinGLSLScrSaver\winglslscrsaver.log`
-
-In fullscreen canvas runs (`--diag=0`/`--diag=7`) the log also contains an `FPS:` line every ~2 s: the loop rate, per-window present rates, and where the frame budget went (pre/render/wait/present timings with min/max) - that is how the present-serialization limit above was measured.
+Silent in Release by default; Debug builds log verbosely; `--diag:N` forces verbose in any build. Log: `%localappdata%\WinGLSLScrSaver\winglslscrsaver.log`. Fullscreen canvas runs add an `FPS:` line every ~2 s (loop rate, per-window present rates, frame-budget timings) - that is how the present-serialization limit was measured.
 
 ## Source (`src\`)
 
@@ -81,18 +80,20 @@ In fullscreen canvas runs (`--diag=0`/`--diag=7`) the log also contains an `FPS:
 | `Program.RunLoop.cs` | partial: render loop, pacing engine (grid/rel/pi), FPS stats |
 | `Core\Log.cs` | debug logging |
 | `Core\Settings.cs` | config file (every key documented in the header comment) |
+| `Core\ShaderCache.cs` | compiled-SPIR-V cache keyed on shader file mtimes |
 | `Gl\Native.cs` | Win32 interop incl. the high-res waitable timer |
 | `Gl\ScreenGroup.cs` | monitor grouping with the 1% merge tolerance |
-| `Gl\ShaderAdapter.cs` | GLSL adaptation, embedded default shader |
-| `Rendering\RenderWindow.cs` | partial: fields, lifecycle, InitGraphics, Render() dispatch |
+| `Gl\ShaderAdapter.cs` | GLSL adaptation, texture declarations, embedded default shader |
+| `Rendering\RenderWindow.cs` | partial: fields, lifecycle, InitGraphics, Render() dispatch, live recompile |
 | `Rendering\RenderWindow.Canvas.cs` | partial: shared-canvas draw/present path, pacing gating, fps overlay |
 | `Rendering\RenderWindow.Diag.cs` | partial: diag 4/5/6 readback helpers |
 | `Rendering\CanvasBlit.cs` | partial: single-device blit pipeline, swapchains, QI helpers |
 | `Rendering\CanvasBlit.Lane.cs` | partial: present-lane machinery (present_lanes=2) with probe + fail-safe fallback |
+| `Rendering\ShaderTextures.cs` | PNG texture lookup, decode (flipped) and binding |
 | `UI\ConfigDialog.cs` | the `/c` dialog |
+| `UI\ShaderEditor.cs` | the `/e` live shader editor with embedded preview |
 
 ## Build and install
 
-`build.cmd` needs the .NET 8 SDK. Output lands in `publish\`: `WinGLSLScrSaver.scr`, `shader.fs`, `build_log.txt`.
+`build.cmd` (needs .NET 8 SDK) outputs `publish\WinGLSLScrSaver.scr` + `shader.fs` + `x64\` (Scintilla's native DLLs - it cannot load them from the single-file bundle, keep the folder next to the `.scr`). For a PowerShell CLI workflow make an exe-named copy on demand or launch the `.scr` from cmd. Self-contained - runs on any Windows 10/11 x64 machine. To install: right-click -> Install, or copy to `C:\Windows\System32` (copy `x64\` along).
 
-The `.scr` is self-contained (runtime and libraries bundled), so it runs on any Windows 10/11 x64 machine with nothing installed. To test, right-click it and choose Install, or copy it to `C:\Windows\System32`.

@@ -12,14 +12,10 @@ using Vortice.DXGI;
 internal partial class CanvasBlit
 {
     // ---- Present lanes (present_lanes=2) ----------------------------------
-    // One D3D11 device is ONE present lane: Present calls on a device
-    // serialize at DWM composition granularity (~5.9ms each), capping
-    // multi-window setups around 83 fps. A second device on the same adapter
-    // is a second, fully parallel present lane for the non-owner windows.
-    // The canvas crosses devices through a keyed-mutex shared texture:
-    // device1 copies the rendered canvas into it once per frame
-    // (Acquire 0 -> CopyResource -> Release 1), each lane device acquires
-    // the same mutex, blits its slice and presents - all on its own thread.
+    // One D3D11 device is one present lane (Present calls serialize at DWM
+    // composition granularity, ~5.9 ms each). A second device is a second,
+    // fully parallel lane; the canvas crosses devices via a keyed-mutex
+    // shared texture (Acquire 0 -> CopyResource -> Release 1 per frame).
     private static D3D.ID3D11Device _laneDev;
     private static D3D.ID3D11DeviceContext _laneCtx;
     private static D3D.ID3D11Texture2D _sharedTex;      // created on device1
@@ -37,9 +33,8 @@ internal partial class CanvasBlit
 
     internal static D3D.ID3D11Device LaneDev => _laneDev;
 
-    // Main thread (device1 ctx), once per tick, ordered after the owner's
-    // pass A draw. Finite Acquire timeout: if a lane device still holds the
-    // mutex, skip this tick's copy (lane shows the previous canvas copy).
+    // Main thread (device1 ctx), once per tick after the owner's pass A
+    // draw. A busy mutex just skips this tick's copy.
     internal static void LaneCopy()
     {
         if (_laneFailed || _sharedTex == null) return;
@@ -55,13 +50,10 @@ internal partial class CanvasBlit
     // Owner calls this at the start of every tick's pass A.
     internal static void BeginFrame() => _sharedFrameCopied = false;
 
-    // One-time: lane device + shared canvas + lane blit pipeline. Fail-safe:
-    // any failure is logged and lanes are disabled (fallback to same-device
-    // presents) instead of killing the screensaver. Capability probe FIRST:
-    // some drivers do not expose IDXGIResource on a MISC_SHARED_KEYEDMUTEX
-    // texture; the probe uses a tiny throwaway texture so a failed init never
-    // leaves half-built lane COM objects behind (they once raced the fallback
-    // path and caused a native AV).
+    // One-time: lane device + shared canvas + lane blit pipeline. Capability
+    // probe FIRST (some drivers do not expose IDXGIResource on a
+    // MISC_SHARED_KEYEDMUTEX texture); any failure is logged and lanes are
+    // disabled instead of killing the screensaver.
     internal static bool EnsureLaneDevice(RenderWindow owner)
     {
         if (_laneDev != null) return true;
@@ -95,8 +87,8 @@ internal partial class CanvasBlit
                 throw new InvalidOperationException($"Lane device creation failed: {r.Code}");
             _laneCtx = _laneDev.ImmediateContext;
 
-            // Shared canvas texture on device1, opened on device2. Same
-            // dimensions/format as the Pie canvas so CopyResource is valid.
+            // Shared canvas texture on device1, opened on device2 (same
+            // dimensions/format as the Pie canvas so CopyResource is valid).
             var cd = _canvasTex2d.Description;
             Log.W($"Canvas desc for sharing: {cd.Width}x{cd.Height} fmt={cd.Format} mip={cd.MipLevels} arr={cd.ArraySize} msaa={cd.SampleDescription.Count}/{cd.SampleDescription.Quality} bind={cd.BindFlags} misc={cd.MiscFlags} usage={cd.Usage}");
             var sdesc = cd;
@@ -148,8 +140,8 @@ internal partial class CanvasBlit
         }
     }
 
-    // Dispose everything a partial lane init may have created, BEFORE the
-    // fallback path starts presenting (no dangling COM objects race it).
+    // Dispose everything a partial lane init created, BEFORE the fallback
+    // path starts presenting.
     private static void CleanupLanePartials()
     {
         try { _laneSamplerLinear?.Dispose(); } catch { }
@@ -182,9 +174,8 @@ internal partial class CanvasBlit
         return _laneDev.CreateBuffer(Array.ConvertAll(verts, v => v.Data), D3D.BindFlags.VertexBuffer);
     }
 
-    // Present thread (device2): acquire mutex, blit this window's slice from
-    // the shared canvas into its own swapchain, release, present. Returns
-    // false when the mutex was busy - the caller skips this tick's present.
+    // Present thread (device2): acquire mutex, blit this window's slice,
+    // release, present. Returns false when the mutex was busy.
     internal static bool LaneDraw(RenderWindow w)
     {
         if (_laneFailed || _laneMutex == null) return false;
@@ -210,14 +201,13 @@ internal partial class CanvasBlit
         return true;
     }
 
-    // Draw this window's slice of the canvas into its own swapchain, then put
-    // the device back into the state the Pie shader pass expects (OM bound to
-    // the canvas RT) - Pie may skip rebinding state it believes is still set.
+    // Draw this window's slice, then restore the device state Pie expects
+    // (OM bound to the canvas RT) - Pie may skip rebinding state it believes
+    // is still set.
     internal static void Draw(RenderWindow w)
     {
         // The present thread may be inside Present()/GetBuffer on this very
-        // swapchain right now - touching it concurrently is the 1-in-5 launch
-        // AV. Wait briefly, then SKIP this tick (one stale frame).
+        // swapchain - touch nothing concurrently; skip this tick if busy.
         if (w.WaitForPresentIdle(8)) return;
 
         // Flip model: the current back buffer must be re-queried every frame.

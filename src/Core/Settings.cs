@@ -32,6 +32,9 @@ internal static class Settings
 //   max_latency=3       DXGI MaximumFrameLatency 1..(swap_buffers-1)
 //   present_lanes=2     1 = one device lane (presents serialize, ~83 fps multi-mon cap);
 //                       2 = per-window device via keyed-mutex shared canvas (default)
+//   editor_bounds=x,y,w,h  shader editor window rect from last close (restored at start)
+//   editor_splitter=700    editor code/preview splitter distance
+//   editor_dpi=192         monitor DPI the editor_bounds/splitter were saved under
 // A legacy config.txt that is a bare folder path (no '=') is still honoured.
 internal sealed class AppSettings
 {
@@ -51,6 +54,11 @@ internal sealed class AppSettings
     public int MaxLatency = 3;      // DXGI MaximumFrameLatency
     public int PresentLanes = 2;    // 1 = one device lane, 2 = per-window lanes (default 2)
     public int RawSwapBlt;          // 0 = flip, 1 = blt 2 buffers, 2 = blt 1 buffer
+    public int ShaderCache = 1;     // 1 = SPIR-V cache ON (default); 0 = always
+                                    // recompile the .fs at every start
+    public string EditorBounds = "";    // shader editor window "x,y,w,h" from last close
+    public int EditorSplitter;          // editor splitter distance (0 = default 700)
+    public int EditorDpi;               // monitor DPI (96/120/144/192...) the above were saved under
 
     public static AppSettings Load()
     {
@@ -120,6 +128,18 @@ internal sealed class AppSettings
                     case "raw_swap_blt":
                         if (int.TryParse(val, out int rsb) && rsb is >= 0 and <= 2) s.RawSwapBlt = rsb;
                         break;
+                    case "shader_cache":
+                        s.ShaderCache = val is "1" or "true" or "on" ? 1 : 0;
+                        break;
+                    case "editor_bounds":
+                        s.EditorBounds = val;
+                        break;
+                    case "editor_splitter":
+                        if (int.TryParse(val, out int es) && es > 0) s.EditorSplitter = es;
+                        break;
+                    case "editor_dpi":
+                        if (int.TryParse(val, out int ed) && ed > 0) s.EditorDpi = ed;
+                        break;
                 }
             }
         }
@@ -152,7 +172,11 @@ internal sealed class AppSettings
                 $"swap_buffers={SwapBuffers}\n" +
                 $"max_latency={MaxLatency}\n" +
                 $"present_lanes={PresentLanes}\n" +
-                $"raw_swap_blt={RawSwapBlt}\n");
+                $"raw_swap_blt={RawSwapBlt}\n" +
+                $"shader_cache={ShaderCache}\n" +
+                $"editor_bounds={EditorBounds}\n" +
+                $"editor_splitter={EditorSplitter}\n" +
+                $"editor_dpi={EditorDpi}\n");
         }
         catch { /* best effort */ }
     }

@@ -1,5 +1,6 @@
 namespace WinGLSLScrSaver;
 
+using System.Diagnostics;
 using System.Numerics;
 using System.Reflection;
 using Pie;
@@ -38,13 +39,14 @@ internal partial class RenderWindow : Form
     private Framebuffer _fb;
     private SamplerState _sampler;
     private SamplerState _pointSampler;   // scaled path: nearest neighbour
+    private List<ShaderTextures.BoundTexture> _userTextures = new(); // R2: shader PNG textures
     private GraphicsBuffer _blitQuadStatic; // scaled path: static fullscreen blit quad
     private int _rtW, _rtH;
     private bool _disposed;
 
-    // ---- Shared canvas architecture (normal runs, diag=0): window 0 hosts
-    // the Pie device and renders the shader ONCE per frame into a master-size
-    // canvas RT; every window blits its crop-to-fit slice on that device.
+    // Shared canvas (normal runs): window 0 hosts the Pie device and renders
+    // the shader once per frame into a master-size canvas RT; every window
+    // blits its crop-to-fit slice.
     internal bool IsCanvasOwner;
     private bool _isRawWindow;
     private DXGI.IDXGISwapChain1 _rawSwap;
@@ -58,9 +60,9 @@ internal partial class RenderWindow : Form
     internal int CanvasH => _rtH;
     internal float ScaleBlend => _scaleBlend;
     internal DXGI.IDXGISwapChain1 RawSwap => _rawSwap;
-    // Raw windows blit into their own swapchain's backbuffer. Flip model:
-    // CanvasBlit.Draw fetches the current back buffer (GetBuffer(0)) and
-    // creates its RTV per frame - no cached RTV is possible.
+    // Raw windows blit into their own flip-model backbuffer: GetBuffer(0)
+    // returns the *current* back buffer, so CanvasBlit.Draw creates its RTV
+    // per frame - no cached RTV is possible.
     internal D3D.ID3D11Buffer RawVb => _rawVb;
     internal int RawW => ClientSize.Width;
     internal int RawH => ClientSize.Height;
@@ -73,8 +75,8 @@ internal partial class RenderWindow : Form
     };
     private static readonly uint[] QuadIndices = { 0u, 1u, 3u, 1u, 2u, 3u };
 
-    // Fullscreen blit quad (TR, BR, BL, TL) - shared by the diag-6 control
-    // buffer, the scaled-path static blit quad and the diag 1/4/6 fills.
+    // Fullscreen blit quad (TR, BR, BL, TL) - shared by diag 1/4/6 and the
+    // scaled path.
     private static readonly VPosUv[] FullscreenQuad = new VPosUv[]
     {
         new(new Vector2( 1f,  1f), new Vector2(1f, 0f)), // top-right
@@ -95,8 +97,8 @@ internal partial class RenderWindow : Form
 
     public bool ShutdownRequested { get; private set; }
 
-    // 1 = present with vsync (auto mode); 0 = present without blocking (FPS
-    // cap set - the loop is paced by the cap). Set by RunLoop before the loop.
+    // 1 = vsync (auto mode); 0 = unblocked (FPS cap set - the loop paces
+    // itself). Set by RunLoop before the loop.
     public int PresentInterval = 1;
 
     // ---- Per-monitor present pacing (fullscreen canvas runs) ---------------
@@ -106,16 +108,36 @@ internal partial class RenderWindow : Form
     public long PresentFrames;          // presents actually handed to DWM
     private bool _dwnLogged;            // WasStillDrawing warning (once)
 
-    // ---- Present thread ----------------------------------------------------
-    // Raw Present(0) costs ~one DWM composition period even with DO_NOT_WAIT;
-    // running that wait on a dedicated thread takes it out of the frame
-    // budget. Only swapchain presents run there - the device context stays
-    // on the main thread (D3D11 immediate context is not thread-safe).
+    // ---- Present thread: raw Present(0) costs ~one DWM composition period
+    // even with DO_NOT_WAIT; a dedicated thread keeps that wait out of the
+    // frame budget. Only swapchain presents run there - the immediate context
+    // stays on the main thread (not thread-safe).
     internal bool UsePresentThread;
-    // True while the present thread is inside a swapchain operation on this
-    // window. The main thread must not touch the same swapchain concurrently:
-    // GetBuffer / RTV creation / ResizeBuffers during an in-flight Present is
-    // driver-level UB (the ~1-in-5 launch AV with present threads on).
+
+    // ---- Editor preview render thread (raw path only): drives this window's
+    // Render() from a dedicated thread so the vsync Present wait never blocks
+    // the WinForms UI thread. UI-thread device access (OnResize) takes the
+    // same lock.
+    internal readonly object EditorLock = new object();
+
+    // When set, Render() queues the swapchain flip to the present thread
+    // instead of blocking the UI thread inside the vsync wait.
+    internal volatile bool UseEditorPresentThread;
+    private volatile bool _editorPresentInFlight;
+    internal bool EditorPresentInFlight => _editorPresentInFlight;
+
+    // ---- Editor preview: deferred swapchain/RT resize ----------------------
+    // OnResize (UI thread) and the present thread must never overlap on the
+    // swapchain: ResizeBuffers during an in-flight Present is driver-level UB
+    // (the silent AV after a while). Protocol: each side sets its flag
+    // (_editorResizeActive / _editorPresentInFlight) FIRST, then checks the
+    // other's flag and backs off - no overlap is possible. A resize that
+    // cannot start stays pending; RenderTick retries until applied.
+    private volatile bool _editorResizePending;   // an OnResize is waiting
+    private volatile bool _editorResizeActive;    // resize being applied now
+    // Present thread inside a swapchain operation: the main thread must not
+    // touch the same swapchain concurrently (GetBuffer / RTV / ResizeBuffers
+    // during an in-flight Present is driver-level UB).
     private volatile bool _presentInFlight;
     internal bool PresentInFlight => _presentInFlight;
     private Thread _presentThread;
@@ -123,11 +145,44 @@ internal partial class RenderWindow : Form
     private readonly ManualResetEvent _presentExit = new(false);
     private volatile float _presentThreadTime;
     private volatile bool _presentQueued;
+    // Submitted-but-not-presented frames; the editor's render timer uses
+    // this as backpressure instead of piling up driver work on the UI thread.
+    private int _presentPending;
+    internal int PresentPending => _presentPending;
+    private int _slowPresentLogs;
+    private double _lastSlowPresentLog;   // Stopwatch seconds of the last slow-present log
 
-    // ---- Present lane (present_lanes=2) ------------------------------------
-    // This window's swapchain lives on a SECOND D3D11 device (a fully
-    // parallel present lane); the canvas crosses devices via a keyed-mutex
-    // shared texture.
+    // Last Present that took >500 ms (0 = none). The editor's status bar
+    // surfaces this - a stall freezes the preview by design (backpressure),
+    // and without this there is nothing on screen to say why.
+    public long LastPresentStallMs;
+
+    // ---- Shadertoy compatibility inputs (uniform buffer slots 1..3) ------
+    private Vector4 _stMouse = Vector4.Zero;  // ctor fills this on preview windows
+    private float _stLastTime = -1f;          // for iTimeDelta
+    private int _stFrame;                     // iFrame
+    private readonly Vector4[] _stUniformData = new Vector4[4];
+
+    // One place updates the whole uniform buffer: iResolution/iTime (slot 0,
+    // existing behaviour) plus iMouse/iFrame/iTimeDelta/iDate. Canvas owner,
+    // scaled and direct paths all call this.
+    private void UpdateShaderUniforms(float time, float resW, float resH)
+    {
+        float dt = _stLastTime < 0f ? 0f : time - _stLastTime;
+        _stLastTime = time;
+        if (dt < 0f || dt > 0.25f) dt = 0f; // first frame or a present stall - no physics spike
+        _stFrame++;
+        DateTime now = DateTime.Now;
+        _stUniformData[0] = new Vector4(resW, resH, 1f, time);
+        _stUniformData[1] = _stMouse;
+        _stUniformData[2] = new Vector4(_stFrame, dt, 0f, 0f);
+        _stUniformData[3] = new Vector4(now.Year, now.Month, now.Day,
+            (float) now.TimeOfDay.TotalSeconds);
+        _device.UpdateBuffer(_uniform, 0, _stUniformData);
+    }
+
+    // ---- Present lane (present_lanes=2): swapchain on a second D3D11
+    // device; the canvas crosses devices via a keyed-mutex shared texture.
     internal bool UseLane;
     private DXGI.IDXGISwapChain1 _laneSwap;
     private IntPtr _laneWaitable;
@@ -163,10 +218,10 @@ internal partial class RenderWindow : Form
         _presentExit.Reset();
     }
 
-    // Hand the present off. Coalescing: if the thread is still busy with the
-    // previous present, the event just latches (natural backpressure).
+    // Coalescing: if the thread is still presenting, the event just latches.
     private void RequestPresent(float time)
     {
+        Interlocked.Increment(ref _presentPending);
         _presentThreadTime = time;
         _presentQueued = true;
         _presentSignal.Set();
@@ -182,8 +237,27 @@ internal partial class RenderWindow : Form
             if (_presentQueued)
             {
                 _presentQueued = false;
+                var sw = Stopwatch.StartNew();
                 try { PresentCore(_presentThreadTime); }
                 catch (Exception ex) { Log.Ex("PresentThread", ex); }
+                Interlocked.Decrement(ref _presentPending);
+                // Sustained multi-second presents = GPU/WARP-bound; the
+                // render timer's backpressure throttles the preview.
+                double ms = sw.ElapsedMilliseconds;
+                if (ms > 500)
+                {
+                    LastPresentStallMs = (long) ms;
+                    double sinceLast = (Stopwatch.GetTimestamp() - _lastSlowPresentLog) * 1000.0
+                                       / Stopwatch.Frequency;
+                    if (_slowPresentLogs >= 20 && sinceLast > 60_000)
+                        _slowPresentLogs = 0; // quiet minute - budget available again
+                    if (_slowPresentLogs < 20)
+                    {
+                        _slowPresentLogs++;
+                        _lastSlowPresentLog = Stopwatch.GetTimestamp();
+                        Log.W($"Present took {ms:F0} ms - GPU-bound; render timer throttled to GPU speed");
+                    }
+                }
             }
         }
     }
@@ -206,15 +280,13 @@ internal partial class RenderWindow : Form
     internal static long FrameLatencyWaitCount;
     internal static int RawPresentFlagMode = 2;
 
-    // show_fps=1: per-window fps overlay counting ACTUAL presented frames
-    // (post gating), not render ticks.
+    // show_fps=1 overlay: counts presented frames (post gating), not ticks.
     private Label _fpsLabel;
     private long _fpsLabelFrames;
     private double _fpsLabelT;
 
-    // tear_fix_child=1 (with show_fps off): a fully transparent child window
-    // over the flip swapchain - the same DWM-composition hack as the fps
-    // label, but invisible (layered child with alpha 0).
+    // tear_fix_child=1 (with show_fps off): invisible layered child window
+    // over the flip swapchain (DWM-composition anti-tear hack).
     private Control _tearFixChild;
 
     private static Cursor _hiddenCursor;
@@ -245,15 +317,23 @@ internal partial class RenderWindow : Form
         KeyPreview = true;
         TopMost = !isPreview;
 
-        // Never paint white: any window surface exposed before the first GPU
-        // frame must be black (white startup flash report).
+        // Any surface exposed before the first GPU frame must be black.
         BackColor = Color.Black;
         SetStyle(ControlStyles.Opaque | ControlStyles.AllPaintingInWmPaint, true);
 
-        // Hide the cursor on EVERY window, not just the canvas owner: raw
-        // windows 1..N never run InitGraphics. Child controls (fps label,
-        // tear-fix child) inherit the parent cursor via Control.Cursor.
+        // Hide the cursor on every window: raw windows never run
+        // InitGraphics, and child controls inherit it.
         if (!isPreview) Cursor = HiddenCursor();
+
+        // Shadertoy iMouse reporting: preview windows only (/t, /e, /p) -
+        // screensaver windows get zeros so a stray move never animates the
+        // saver. Y is flipped to Shadertoy's bottom-left origin.
+        if (isPreview)
+        {
+            MouseMove += (_, e) => _stMouse = new Vector4(e.X, ClientSize.Height - e.Y, _stMouse.Z, _stMouse.W);
+            MouseDown += (_, e) => _stMouse = new Vector4(_stMouse.X, _stMouse.Y, e.X, ClientSize.Height - e.Y);
+            MouseUp   += (_, _) => _stMouse = new Vector4(_stMouse.X, _stMouse.Y, _stMouse.Z, -Math.Abs(_stMouse.W));
+        }
 
         _master = master;
         _groupBbox = groupBbox;
@@ -285,17 +365,29 @@ internal partial class RenderWindow : Form
                 return false;
             }
 
-            // Debug=true is FORBIDDEN - Pie 0.10.1's DebugGraphicsDevice throws
-            // SEHException natively on SetDepthStencilState here.
+            // Pie 0.10.1's DebugGraphicsDevice throws SEHException on
+            // SetDepthStencilState - Debug=true is forbidden.
             _device = GraphicsDevice.CreateD3D11(hwnd, cs, new GraphicsDeviceOptions { Debug = false });
-            Log.W("InitGraphics: D3D11 device created");
+            string adapterName = _device.Adapter.ToString() ?? "";
+            Log.W($"InitGraphics: D3D11 device created, adapter='{adapterName}'"
+                + (adapterName.IndexOf("Software", StringComparison.OrdinalIgnoreCase) >= 0
+                    || adapterName.IndexOf("WARP", StringComparison.OrdinalIgnoreCase) >= 0
+                    || adapterName.IndexOf("Basic", StringComparison.OrdinalIgnoreCase) >= 0
+                    ? "  (SOFTWARE RENDERING - heavy shaders will run at seconds per frame)" : ""));
 
+            // Cache hit: the fragment arrives as precompiled SPIR-V and
+            // shaderc is skipped (Pie still runs SPIRV-Cross -> HLSL).
             _mainShader = _device.CreateShader(new[]
             {
                 new ShaderAttachment(ShaderStage.Vertex, vertexShader),
-                new ShaderAttachment(ShaderStage.Fragment, fragmentShader),
+                Program.FragmentSpirv != null
+                    ? new ShaderAttachment(ShaderStage.Fragment, Program.FragmentSpirv, "main")
+                    : new ShaderAttachment(ShaderStage.Fragment, fragmentShader),
             });
-            Log.W("InitGraphics: main shader compiled (GLSL -> SPIR-V -> HLSL)");
+            Log.W($"InitGraphics: main shader compiled ({(Program.FragmentSpirv != null ? "cached SPIR-V" : "GLSL")} -> HLSL)");
+
+            // Load + bind the PNG textures the shader references.
+            _userTextures = ShaderTextures.CreateAll(_device, fragmentShader, Program.ActiveShaderPath);
 
             _mainLayout = _device.CreateInputLayout(
                 new InputLayoutDescription(Format.R32G32_Float, 0, 0, InputType.PerVertex));
@@ -310,9 +402,9 @@ void main()
     gl_Position = vec4(aPosUv.xy, 0.0, 1.0);
 }";
 
-            // Blit fragment with the interpolation blend BAKED IN (a spec
-            // constant would have to survive shaderc -> SPIRV-Cross -> HLSL).
-            // Formatted with "0.0###": GLSL forbids a bare "0f"/"1f" literal.
+            // Blend baked into the source (a spec constant would not survive
+            // shaderc -> SPIRV-Cross -> HLSL); "0.0###" because GLSL forbids
+            // a bare "0f"/"1f" literal.
             string BlitFragment = $@"
 #version 450
 layout (location = 0) in vec2 vUv;
@@ -348,22 +440,21 @@ void main()
             _depthDisabled = _device.CreateDepthStencilState(DepthStencilStateDescription.Disabled);
             _quadVb = _device.CreateBuffer(BufferType.VertexBuffer, QuadVertices);
             _indexBuffer = _device.CreateBuffer(BufferType.IndexBuffer, QuadIndices);
-            _uniform = _device.CreateBuffer(BufferType.UniformBuffer, Vector4.Zero, true);
+            _uniform = _device.CreateBuffer(BufferType.UniformBuffer, new Vector4[4], true);
 
-            // RT / blit machinery: diag modes AND the scaled path. At
+            // RT / blit machinery: diag modes and the scaled path; at
             // res_mult == 1.0 with no diag the normal path renders straight
             // to the backbuffer.
             if (!Program.CanvasPipeline || IsCanvasOwner)
             {
-                // Normal runs: the blit VB holds this window's canvas-slice
-                // quad; diag modes: the fullscreen letterbox blit quad.
+                // Normal runs: this window's canvas-slice quad; diag: the
+                // fullscreen letterbox quad.
                 _blitVb = _device.CreateBuffer(BufferType.VertexBuffer,
                     Program.CanvasPipeline ? ComputeCanvasVerts() : ComputeBlitVerts());
                 _blitVbStatic = _device.CreateBuffer(BufferType.VertexBuffer, FullscreenQuad);
 
-                // RT sizes: diag 5/6 need the master-size RT for readbacks;
-                // other diag modes use client x mult; a normal run uses the
-                // SHARED CANVAS at master size x mult.
+                // diag 5/6 need the master-size RT for readbacks; a normal
+                // run uses the shared canvas at master size x mult.
                 int rtW, rtH;
                 if (Program.DiagMode is 5 or 6) { rtW = _master.Width; rtH = _master.Height; }
                 else if (Program.CanvasPipeline)
@@ -386,10 +477,6 @@ void main()
                 Log.W($"InitGraphics: {(Program.CanvasPipeline ? "canvas" : "scaled path")} RT {rtW}x{rtH} (master={_master.Width}x{_master.Height}, mult={_resMult:0.###}, blend={_scaleBlend:0.###})");
             }
 
-            // (Cursor hiding moved to the constructor: raw windows 1..N never
-            // reach InitGraphics.)
-
-            // Normal runs: this window hosts the shared device.
             if (Program.CanvasPipeline && IsCanvasOwner)
                 CanvasBlit.EnsureShared(this);
 
@@ -437,6 +524,8 @@ void main()
         try
         {
             _rt?.Dispose(); _fb?.Dispose(); _sampler?.Dispose(); _pointSampler?.Dispose();
+            foreach (var t in _userTextures) t.Dispose();
+            _userTextures.Clear();
             _blitVb?.Dispose(); _blitVbStatic?.Dispose(); _blitQuadStatic?.Dispose();
             _rawSwap?.Dispose(); _rawVb?.Dispose();
             _laneSwap?.Dispose(); _laneVb?.Dispose(); _laneWaitable = IntPtr.Zero;
@@ -449,12 +538,109 @@ void main()
         catch (Exception ex) { Log.Ex("DisposeGraphics", ex); }
     }
 
+    internal bool MainShaderReady => _mainShader != null;
+
+    // Bind the shader's PNG textures (bindings 1..N) in every main-shader
+    // draw path - the blit pass overwrites PS slots 0/1 right after.
+    private void BindUserTextures()
+    {
+        if (_userTextures.Count == 0 || _sampler == null) return;
+        foreach (var t in _userTextures)
+            _device.SetTexture((uint) t.Slot, t.Tex, _sampler);
+    }
+
+    // Runtime shader swap (editor live preview), split so the shaderc part
+    // can run off the UI thread: CompileFragmentSource is device-free,
+    // ApplyCompiledFragment does the device swap.
+
+    public sealed class FragmentCompile
+    {
+        public int Gen;             // editor-side generation (stale-discard)
+        public byte[] Spirv;        // compiled fragment SPIR-V (null on error)
+        public string Frag;         // composed GLSL source (drives texture load)
+        public string Error;        // null on success
+    }
+
+    // CPU-only part: compose + shaderc, no device access - safe on any
+    // thread and before InitGraphics.
+    public FragmentCompile CompileFragmentSource(string userSrc)
+    {
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            string frag = ShaderAdapter.ComposeFragment(userSrc);
+            var res = Compiler.ToSpirv(ShaderStage.Fragment, Language.GLSL,
+                System.Text.Encoding.UTF8.GetBytes(frag), "main");
+            Log.W($"CompileFragmentSource: {sw.ElapsedMilliseconds} ms, {userSrc.Length} chars, {(res.IsSuccess ? "OK" : "error")}");
+            return res.IsSuccess
+                ? new FragmentCompile { Spirv = res.Result, Frag = frag }
+                : new FragmentCompile { Error = res.Error };
+        }
+        catch (Exception ex)
+        {
+            Log.Ex("CompileFragmentSource", ex);
+            return new FragmentCompile { Error = ex.Message };
+        }
+    }
+
+    // Device-side swap, UI thread. Returns null on success, else error text.
+    public string ApplyCompiledFragment(byte[] spirv, string frag)
+    {
+        if (_device == null) return "preview not initialized yet";
+        lock (EditorLock)
+        {
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                Shader next = _device.CreateShader(new[]
+                {
+                    new ShaderAttachment(ShaderStage.Vertex, ShaderAdapter.VertexShader),
+                    new ShaderAttachment(ShaderStage.Fragment, spirv, "main"),
+                });
+
+                // Swap the shader first; dispose the old texture set only
+                // after the new one is created on the same device.
+                _mainShader?.Dispose();
+                _mainShader = next;
+                var nextTextures = ShaderTextures.CreateAll(_device, frag, Program.ActiveShaderPath);
+                foreach (var t in _userTextures) t.Dispose();
+                _userTextures = nextTextures;
+
+                Log.W($"ApplyCompiledFragment: shader swapped OK in {sw.ElapsedMilliseconds} ms");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Log.Ex("ApplyCompiledFragment", ex);
+                return ex.Message;
+            }
+        }
+    }
+
+    // Convenience wrapper (synchronous, UI thread) - kept for fallback use.
+    public string RecompileFragment(string userSrc)
+    {
+        var r = CompileFragmentSource(userSrc);
+        if (r.Error != null) return r.Error;
+        return ApplyCompiledFragment(r.Spirv, r.Frag);
+    }
+
+    // Editor init with an off-thread compiled fragment (avoids the shaderc
+    // freeze on the UI thread); spirv=null inits with a GLSL fallback source
+    // (compile-error display path).
+    public bool InitGraphics(string vertexShader, byte[] fragSpirv, string fragSource)
+    {
+        Program.FragmentSpirv = fragSpirv;
+        try { return InitGraphics(vertexShader, fragSource); }
+        finally { Program.FragmentSpirv = null; }
+    }
+
     public void Render(float time)
     {
         if (_disposed) return;
         if (Program.CanvasPipeline)
         {
-            // Shared canvas path: DRAW phase only (presents happen in Present()).
+            // DRAW phase only (presents happen in Present()).
             CanvasDraw(time);
             return;
         }
@@ -463,9 +649,8 @@ void main()
         int w = ClientSize.Width, h = ClientSize.Height;
         if (w <= 0 || h <= 0) return;
 
-        // ---- DIAG 5: (a) gradient into the RT + readback, (b) magenta clear
-        // on the backbuffer, no draw, + readback. Decides: broken draw
-        // pipeline vs broken swapchain/present path.
+        // DIAG 5: (a) gradient into the RT + readback, (b) magenta backbuffer
+        // clear + readback - draw pipeline vs swapchain/present path.
         if (Program.DiagMode == 5)
         {
             _device.SetFramebuffer(_fb);
@@ -497,8 +682,8 @@ void main()
             return;
         }
 
-        // ---- DIAG 6: isolate the broken blit component. A=main path (control),
-        // B=blit with DYNAMIC VB via UpdateBuffer, C=blit with STATIC VB.
+        // DIAG 6: A=main path (control), B=blit with dynamic VB
+        // (UpdateBuffer), C=blit with static VB.
         if (Program.DiagMode == 6)
         {
             _diagFrames++;
@@ -508,7 +693,7 @@ void main()
                 _device.SetFramebuffer(_fb);
                 _device.Viewport = new Rectangle(0, 0, _master.Width, _master.Height);
 
-                // A: main path control.
+                // A: main path.
                 _device.ClearColorBuffer(0f, 1f, 0f, 1f);
                 _device.UpdateBuffer(_uniform, 0, new Vector4(_master.Width, _master.Height, 1f, time));
                 _device.SetShader(_mainShader);
@@ -521,7 +706,7 @@ void main()
                 _device.DrawIndexed(6u);
                 DumpD3DTex(_rtRT, "RT-A-mainpath");
 
-                // B: blit path with dynamic VB (UpdateBuffer-filled).
+                // B: dynamic VB (UpdateBuffer-filled).
                 _device.ClearColorBuffer(0f, 1f, 0f, 1f);
                 VPosUv[] gv = FullscreenQuad;
                 _device.UpdateBuffer(_blitVb, 0, gv);
@@ -534,7 +719,7 @@ void main()
                 _device.DrawIndexed(6u);
                 DumpD3DTex(_rtRT, "RT-B-blit-dynamic");
 
-                // C: blit path with static VB (initial data, no UpdateBuffer).
+                // C: static VB (initial data).
                 _device.ClearColorBuffer(0f, 1f, 0f, 1f);
                 _device.SetVertexBuffer(0u, _blitVbStatic, 16u);
                 _device.DrawIndexed(6u);
@@ -547,7 +732,7 @@ void main()
             return;
         }
 
-        // ---- DIAG 1/4: gradient straight to the backbuffer (4 adds readback).
+        // DIAG 1/4: gradient straight to the backbuffer (4 adds readback).
         if (Program.DiagMode is 1 or 4)
         {
             _device.SetFramebuffer(null);
@@ -575,18 +760,19 @@ void main()
             return;
         }
 
-        // ---- Scaled path (res_mult < 1.0): Pass A renders into the small RT,
-        // Pass B upscales to the backbuffer with the blended sampler. Both
-        // VBs are STATIC - Pie 0.10.1's UpdateBuffer on dynamic VBs fails.
+        // Scaled path (res_mult < 1.0): render into the small RT, upscale
+        // with the blended sampler. Static VBs - Pie 0.10.1's UpdateBuffer on
+        // dynamic VBs fails.
         if (ScaledPath)
         {
             int rtW = _rtW, rtH = _rtH;
 
             _device.SetFramebuffer(_fb);
             _device.Viewport = new Rectangle(0, 0, rtW, rtH);
-            _device.UpdateBuffer(_uniform, 0, new Vector4(rtW, rtH, 1f, time));
+            UpdateShaderUniforms(time, rtW, rtH);
             _device.SetShader(_mainShader);
             _device.SetUniformBuffer(0u, _uniform);
+            BindUserTextures();
             _device.SetDepthStencilState(_depthDisabled);
             _device.SetPrimitiveType(PrimitiveType.TriangleList);
             _device.SetInputLayout(_mainLayout);
@@ -606,17 +792,17 @@ void main()
             _device.SetIndexBuffer(_indexBuffer, IndexType.UInt);
             _device.DrawIndexed(6u);
 
+            if (UseEditorPresentThread) { RequestPresent(time); return; }
             _device.Present(PresentInterval);
             return;
         }
 
-        // ---- Single-pass direct rendering (res_mult == 1.0): the shader
-        // renders at THIS monitor's native resolution, uv 0..1 spans the
-        // whole screen.
+        // Direct path (res_mult == 1.0): the shader renders at this
+        // monitor's native resolution.
         _device.SetFramebuffer(null);
         _device.Viewport = new Rectangle(0, 0, w, h);
         Vector4 resolutionTime = new Vector4(w, h, 1f, time);
-        _device.UpdateBuffer(_uniform, 0, resolutionTime);
+        UpdateShaderUniforms(time, w, h);
 
         if (Program.DiagMode == 3 && _frameLogs < 10)
         {
@@ -626,6 +812,7 @@ void main()
 
         _device.SetShader(_mainShader);
         _device.SetUniformBuffer(0u, _uniform);
+        BindUserTextures();
         _device.SetDepthStencilState(_depthDisabled);
         _device.SetPrimitiveType(PrimitiveType.TriangleList);
         _device.SetInputLayout(_mainLayout);
@@ -633,10 +820,10 @@ void main()
         _device.SetIndexBuffer(_indexBuffer, IndexType.UInt);
         _device.DrawIndexed(6u);
 
-        _device.Present(PresentInterval); // auto mode = 1 (vsync): Present(0)+
-                            // AllowTearing silently fails on some drivers
-                            // (Pie ignores the DXGI result), leaving black
-                            // screens. With an FPS cap the interval is 0.
+        if (UseEditorPresentThread) { RequestPresent(time); return; }
+        // vsync: Present(0)+AllowTearing silently fails on some drivers
+        // (black screens); with an FPS cap the interval is 0.
+        _device.Present(PresentInterval);
     }
 
     private void RequestShutdown()
@@ -661,9 +848,15 @@ void main()
     }
 
     private const int WM_DISPLAYCHANGE = 0x007E;
+    private const int WM_DPICHANGED = 0x02E0;
 
     protected override void WndProc(ref Message m)
     {
+        // Per-monitor DPI (editor process): never let WinForms rescale the
+        // render surface - our size is driven by the editor's host panel in
+        // physical pixels, and a framework rescale would fight the swapchain
+        // sizing. Ignoring the message is fine for a child window.
+        if (m.Msg == WM_DPICHANGED) return;
         if (m.Msg == WM_DISPLAYCHANGE)
         {
             int w = (short) ((long) m.LParam & 0xFFFF);
@@ -679,12 +872,20 @@ void main()
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
-        // Log real size changes only - a spurious resize that coincides with
-        // a monitor blink is a valuable diagnostic clue.
+        // Log real size changes only - a spurious resize coinciding with a
+        // monitor blink is a diagnostic clue.
         if (ClientSize.Width != _lastLoggedW || ClientSize.Height != _lastLoggedH)
         {
             _lastLoggedW = ClientSize.Width; _lastLoggedH = ClientSize.Height;
             Log.W($"OnResize: client now {ClientSize.Width}x{ClientSize.Height}");
+        }
+        // Editor: coalesce resizes, apply when the present thread is idle
+        // (ApplyEditorResize).
+        if (UseEditorPresentThread)
+        {
+            _editorResizePending = true;
+            ApplyEditorResize(100);
+            return;
         }
         try
         {
@@ -697,8 +898,8 @@ void main()
                     Program.CanvasPipeline ? ComputeCanvasVerts() : ComputeBlitVerts());
                 Log.W($"OnResize: blit VB rebuilt for {ClientSize.Width}x{ClientSize.Height}");
             }
-            // Scaled path only: rebuild the RT at client size x multiplier.
-            // The shared canvas RT is master sized and must NOT follow resizes.
+            // Scaled path only: rebuild the RT; the shared canvas RT must
+            // NOT follow resizes.
             if (_device != null && _rt != null && _resMult < 1f && !Program.CanvasPipeline)
             {
                 int rtW = Math.Max(1, (int) Math.Round(ClientSize.Width * _resMult));
@@ -713,5 +914,64 @@ void main()
             }
         }
         catch (Exception ex) { Log.Ex("OnResize/ResizeSwapchain", ex); }
+    }
+
+    // Called every tick so a pending resize is applied at the newest size
+    // once the present thread is idle.
+    internal void ApplyPendingEditorResize()
+    {
+        if (_editorResizePending) ApplyEditorResize(0);
+    }
+
+    private void ApplyEditorResize(int waitMs)
+    {
+        if (_device == null || _disposed)
+        {
+            _editorResizePending = false;
+            return;
+        }
+        if (_editorResizeActive) return; // already applying - the pending flag survives
+        _editorResizeActive = true;      // FIRST: present thread now skips its Present
+        try
+        {
+            // Drain an in-flight Present, bounded (a hung Present must not
+            // hang the UI thread).
+            if (_editorPresentInFlight)
+            {
+                var swIdle = Stopwatch.StartNew();
+                while (_editorPresentInFlight && swIdle.ElapsedMilliseconds < waitMs)
+                    Thread.Yield();
+                if (_editorPresentInFlight) return; // still busy - stay pending
+            }
+
+            _device.ResizeSwapchain(new Size(ClientSize.Width, ClientSize.Height));
+            // Rebuild the static blit VB for the new client geometry.
+            if (_blitVb != null)
+            {
+                _blitVb.Dispose();
+                _blitVb = _device.CreateBuffer(BufferType.VertexBuffer,
+                    Program.CanvasPipeline ? ComputeCanvasVerts() : ComputeBlitVerts());
+            }
+            // Scaled path only: rebuild the RT; the shared canvas RT must
+            // NOT follow resizes.
+            if (_rt != null && _resMult < 1f && !Program.CanvasPipeline)
+            {
+                int rtW = Math.Max(1, (int) Math.Round(ClientSize.Width * _resMult));
+                int rtH = Math.Max(1, (int) Math.Round(ClientSize.Height * _resMult));
+                if (rtW != _rtW || rtH != _rtH)
+                {
+                    _rt.Dispose();
+                    _fb.Dispose();
+                    _rt = _device.CreateTexture(TextureDescription.Texture2D(rtW, rtH,
+                        Format.R8G8B8A8_UNorm, 1, 1, TextureUsage.Framebuffer | TextureUsage.ShaderResource));
+                    _fb = _device.CreateFramebuffer(new FramebufferAttachment(_rt));
+                    _rtW = rtW; _rtH = rtH;
+                }
+            }
+            _editorResizePending = false;
+            Log.W($"OnResize: editor swapchain applied {ClientSize.Width}x{ClientSize.Height} (RT {_rtW}x{_rtH})");
+        }
+        catch (Exception ex) { Log.Ex("OnResize/editor", ex); }
+        finally { _editorResizeActive = false; }
     }
 }

@@ -53,11 +53,10 @@ internal partial class Program
         foreach (var w in windows) w.PresentInterval = presentInterval;
         Log.W($"All windows shown (presentInterval={presentInterval}, gating={canvasMode})");
 
-        // Present threads + lanes: each non-owner window presents from its own
-        // thread and (lanes=2) its own D3D11 device, because Present calls on
-        // ONE device serialize at DWM composition granularity (~5.9ms each).
-        // The owner stays on the main thread - the Pie device context is not
-        // thread-safe and its present is cheap.
+        // Present threads + lanes: Present calls on ONE device serialize at
+        // DWM composition granularity (~5.9ms each), so each non-owner window
+        // presents from its own thread and (lanes=2) its own device. The
+        // owner stays on the main thread (context is not thread-safe).
         bool lanes = canvasMode && Cfg.PresentLanes == 2;
         bool usePresentThreads = canvasMode && (Cfg.PresentThreads || lanes);
         if (usePresentThreads)
@@ -72,9 +71,9 @@ internal partial class Program
 
         var sw = Stopwatch.StartNew();
         var frame = TimeSpan.FromMilliseconds(1000.0 / targetFps);
-        // Timer-paced modes: any FPS cap, and fullscreen canvas runs. Sleep(1)
-        // is unreliable here - since Win10 2004 raised timer resolution only
-        // applies to the FOCUSED process, and a screensaver never has focus.
+        // Timer-paced modes: any FPS cap, and fullscreen canvas runs.
+        // Sleep(1) is unreliable - raised timer resolution only applies to
+        // the focused process, and a screensaver never has focus.
         bool timerPaced = canvasMode || fpsCap > 0;
         int paceFps = fpsCap > 0 ? fpsCap : targetFps;
         var capFrame = timerPaced ? TimeSpan.FromMilliseconds(1000.0 / paceFps) : TimeSpan.Zero;
@@ -185,9 +184,8 @@ internal partial class Program
             {
                 if (paceMode == "grid")
                 {
-                    // Old absolute-grid pacing (kept for A/B comparison): waits
-                    // for the next ceil-quantized grid slot; phase jitter can
-                    // push frames into the next slot (measured ~80 fps @ 120 cap).
+                    // Old absolute-grid pacing (kept for A/B comparison):
+                    // phase jitter can push frames into the next slot.
                     var elapsed = sw.Elapsed;
                     var nextFrame = TimeSpan.FromTicks((long) Math.Ceiling(elapsed.Ticks / (double) capFrame.Ticks) * capFrame.Ticks);
                     var remain = nextFrame - elapsed;
