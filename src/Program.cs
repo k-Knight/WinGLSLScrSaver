@@ -31,6 +31,10 @@ internal partial class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        // Extract embedded Scintilla native DLLs to x64\ next to the exe
+        // before anything that could touch Scintilla (its type initializer
+        // runs on first use, so this must win the race).
+        NativeDeps.Ensure();
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
             Log.Ex("UnhandledException", (Exception) e.ExceptionObject);
 

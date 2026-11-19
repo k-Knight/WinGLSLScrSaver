@@ -40,17 +40,16 @@ ren publish\WinGLSLScrSaver.exe WinGLSLScrSaver.scr >nul
 del publish\WinGLSLScrSaver.pdb >nul 2>nul
 if exist shaders\shader_techno.fs copy /y shaders\shader_techno.fs publish\shader.fs >nul
 
-rem Scintilla.NET does NOT load its native DLLs (Scintilla.dll / Lexilla.dll)
-rem through the .NET single-file host - its type initializer probes the disk
-rem for an x64\ subfolder next to the app. In a single-file bundle those
-rem files never exist on disk, so we must deploy them beside the .scr or the
-rem editor crashes with TypeInitializationException on startup.
-if not exist publish\x64 mkdir publish\x64
-copy /y bin\Release\net8.0-windows\win-x64\x64\Scintilla.dll publish\x64\ >nul
-copy /y bin\Release\net8.0-windows\win-x64\x64\Lexilla.dll publish\x64\ >nul
+rem Scintilla's native DLLs (Scintilla.dll / Lexilla.dll) can NOT be loaded
+rem from inside the single-file bundle - the OS loader needs real files on
+rem disk. They are therefore EMBEDDED in the .scr as resources and written to
+rem an x64\ folder next to the executable at startup (NativeDeps.Ensure in
+rem Program.Main). No deploy step needed here - the .scr is portable alone;
+rem delete x64\ and it is recreated on the next launch.
 
 echo.
-echo Done. In publish\: WinGLSLScrSaver.scr (install) + shader.fs + x64\ (Scintilla native)
+echo Done. In publish\: WinGLSLScrSaver.scr (install) + shader.fs
+rem (the .scr carries Scintilla's native DLLs embedded; it self-extracts x64\ on first run)
 echo For CLI use from PowerShell: copy WinGLSLScrSaver.scr WinGLSLScrSaver.exe
 echo or launch the .scr from cmd (argv passes through), e.g. -t file.fs
 endlocal

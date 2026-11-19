@@ -81,6 +81,7 @@ Silent in Release by default; Debug builds log verbosely; `--diag:N` forces verb
 | `Core\Log.cs` | debug logging |
 | `Core\Settings.cs` | config file (every key documented in the header comment) |
 | `Core\ShaderCache.cs` | compiled-SPIR-V cache keyed on shader file mtimes |
+| `Core\NativeDeps.cs` | extracts the embedded Scintilla native DLLs to `x64\` next to the exe at startup |
 | `Gl\Native.cs` | Win32 interop incl. the high-res waitable timer |
 | `Gl\ScreenGroup.cs` | monitor grouping with the 1% merge tolerance |
 | `Gl\ShaderAdapter.cs` | GLSL adaptation, texture declarations, embedded default shader |
@@ -95,5 +96,5 @@ Silent in Release by default; Debug builds log verbosely; `--diag:N` forces verb
 
 ## Build and install
 
-`build.cmd` (needs .NET 8 SDK) outputs `publish\WinGLSLScrSaver.scr` + `shader.fs` + `x64\` (Scintilla's native DLLs - it cannot load them from the single-file bundle, keep the folder next to the `.scr`). For a PowerShell CLI workflow make an exe-named copy on demand or launch the `.scr` from cmd. Self-contained - runs on any Windows 10/11 x64 machine. To install: right-click -> Install, or copy to `C:\Windows\System32` (copy `x64\` along).
+`build.cmd` (needs .NET 8 SDK) outputs `publish\WinGLSLScrSaver.scr` + `shader.fs`. Scintilla's native DLLs are embedded in the `.scr` and extracted to `x64\` next to it at first launch; deleting the folder just gets it recreated. For a PowerShell CLI workflow make an exe-named copy on demand or launch the `.scr` from cmd. Self-contained - runs on any Windows 10/11 x64 machine. Install: right-click -> Install, or copy to `%localappdata%\WinGLSLScrSaver` (best location - writable, so `x64\` can be extracted; System32 needs admin and is read-only for users).
 
